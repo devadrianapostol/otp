@@ -1,7 +1,7 @@
 /*
  * %CopyrightBegin%
  *
- * Copyright Ericsson AB 1996-2017. All Rights Reserved.
+ * Copyright Ericsson AB 1996-2018. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -40,25 +40,51 @@
 #define DFLAG_UNICODE_IO          0x1000
 #define DFLAG_DIST_HDR_ATOM_CACHE 0x2000
 #define DFLAG_SMALL_ATOM_TAGS     0x4000
-#define DFLAG_INTERNAL_TAGS       0x8000
+#define DFLAG_INTERNAL_TAGS       0x8000   /* used by ETS 'compressed' option */
 #define DFLAG_UTF8_ATOMS          0x10000
 #define DFLAG_MAP_TAG             0x20000
 #define DFLAG_BIG_CREATION        0x40000
 #define DFLAG_SEND_SENDER         0x80000
-#define DFLAG_NO_MAGIC            0x100000
+#define DFLAG_NO_MAGIC            0x100000 /* internal for pending connection */
 
-/* Mandatory flags for distribution (sync with dist_util.erl) */
+/* Mandatory flags for distribution */
 #define DFLAG_DIST_MANDATORY (DFLAG_EXTENDED_REFERENCES         \
                               | DFLAG_EXTENDED_PIDS_PORTS       \
 			      | DFLAG_UTF8_ATOMS                \
 			      | DFLAG_NEW_FUN_TAGS)
 
-/* Additional optimistic flags when encoding toward pending connection */
-#define DFLAG_DIST_HOPEFULLY (DFLAG_NO_MAGIC                    \
-                              | DFLAG_EXPORT_PTR_TAG            \
+/*
+ * Additional optimistic flags when encoding toward pending connection.
+ * If remote node (erl_interface) does not supporting these then we may need
+ * to transcode messages enqueued before connection setup was finished.
+ */
+#define DFLAG_DIST_HOPEFULLY (DFLAG_EXPORT_PTR_TAG              \
                               | DFLAG_BIT_BINARIES              \
                               | DFLAG_DIST_MONITOR              \
                               | DFLAG_DIST_MONITOR_NAME)
+
+/* Our preferred set of flags. Used for connection setup handshake */
+#define DFLAG_DIST_DEFAULT (DFLAG_DIST_MANDATORY | DFLAG_DIST_HOPEFULLY \
+                            | DFLAG_FUN_TAGS                  \
+                            | DFLAG_NEW_FLOATS                \
+                            | DFLAG_UNICODE_IO                \
+                            | DFLAG_DIST_HDR_ATOM_CACHE       \
+                            | DFLAG_SMALL_ATOM_TAGS           \
+                            | DFLAG_UTF8_ATOMS                \
+                            | DFLAG_MAP_TAG                   \
+                            | DFLAG_BIG_CREATION              \
+                            | DFLAG_SEND_SENDER)
+
+/* Flags addable by local distr implementations */
+#define DFLAG_DIST_ADDABLE    DFLAG_DIST_DEFAULT
+
+/* Flags rejectable by local distr implementation */
+#define DFLAG_DIST_REJECTABLE (DFLAG_DIST_HDR_ATOM_CACHE         \
+                               | DFLAG_HIDDEN_ATOM_CACHE         \
+                               | DFLAG_ATOM_CACHE)
+
+/* Flags for all features needing strict order delivery */
+#define DFLAG_DIST_STRICT_ORDER DFLAG_DIST_HDR_ATOM_CACHE
 
 /* All flags that should be enabled when term_to_binary/1 is used. */
 #define TERM_TO_BINARY_DFLAGS (DFLAG_EXTENDED_REFERENCES	\
@@ -94,7 +120,6 @@
 
 /* distribution trap functions */
 extern Export* dmonitor_node_trap;
-extern Export* dmonitor_p_trap;
 
 typedef enum {
     ERTS_DSP_NO_LOCK,
@@ -110,14 +135,6 @@ typedef struct {
     Eterm connection_id;
     int no_suspend;
 } ErtsDSigData;
-
-#define ERTS_DE_IS_NOT_CONNECTED(DEP) \
-  (ERTS_LC_ASSERT(erts_lc_rwmtx_is_rlocked(&(DEP)->rwmtx) \
-		      || erts_lc_rwmtx_is_rwlocked(&(DEP)->rwmtx)), \
-   (is_nil((DEP)->cid) || ((DEP)->status & ERTS_DE_SFLG_EXITING)))
-
-#define ERTS_DE_IS_CONNECTED(DEP) \
-  (!ERTS_DE_IS_NOT_CONNECTED((DEP)))
 
 #define ERTS_DE_BUSY_LIMIT (1024*1024)
 extern int erts_dist_buf_busy_limit;
@@ -181,18 +198,18 @@ erts_dsig_prepare(ErtsDSigData *dsdp,
 retry:
     erts_de_rlock(dep);
 
-    if (ERTS_DE_IS_CONNECTED(dep)) {
+    if (dep->state == ERTS_DE_STATE_CONNECTED) {
 	res = ERTS_DSIG_PREP_CONNECTED;
     }
-    else if (dep->status & ERTS_DE_SFLG_PENDING) {
+    else if (dep->state == ERTS_DE_STATE_PENDING) {
 	res = ERTS_DSIG_PREP_PENDING;
     }
-    else if (dep->status & ERTS_DE_SFLG_EXITING) {
+    else if (dep->state == ERTS_DE_STATE_EXITING) {
 	res = ERTS_DSIG_PREP_NOT_CONNECTED;
 	goto fail;
     }
     else if (connect) {
-        ASSERT(dep->status == 0);
+        ASSERT(dep->state == ERTS_DE_STATE_IDLE);
         erts_de_runlock(dep);
         if (!erts_auto_connect(dep, proc, proc_locks)) {
             return ERTS_DSIG_PREP_NOT_ALIVE;
@@ -200,7 +217,7 @@ retry:
 	goto retry;
     }
     else {
-        ASSERT(dep->status == 0);
+        ASSERT(dep->state == ERTS_DE_STATE_IDLE);
 	res = ERTS_DSIG_PREP_NOT_CONNECTED;
 	goto fail;
     }
@@ -256,57 +273,12 @@ void erts_schedule_dist_command(Port *prt, DistEntry *dist_entry)
 
 #endif
 
-typedef struct {
-    ErtsLink *d_lnk;
-    ErtsLink *d_sub_lnk;
-} ErtsDistLinkData;
-
-ERTS_GLB_INLINE void erts_remove_dist_link(ErtsDistLinkData *,
-					   Eterm,
-					   Eterm,
-					   DistEntry *);
-ERTS_GLB_INLINE int erts_was_dist_link_removed(ErtsDistLinkData *);
-ERTS_GLB_INLINE void erts_destroy_dist_link(ErtsDistLinkData *);
-
-#if ERTS_GLB_INLINE_INCL_FUNC_DEF
-
-ERTS_GLB_INLINE void
-erts_remove_dist_link(ErtsDistLinkData *dldp,
-		      Eterm lid,
-		      Eterm rid,
-		      DistEntry *dep)
-{
-    erts_de_links_lock(dep);
-    dldp->d_lnk = erts_lookup_link(dep->nlinks, lid);
-    if (!dldp->d_lnk)
-	dldp->d_sub_lnk = NULL;
-    else {
-	dldp->d_sub_lnk = erts_remove_link(&ERTS_LINK_ROOT(dldp->d_lnk), rid);
-	dldp->d_lnk = (ERTS_LINK_ROOT(dldp->d_lnk)
-		       ? NULL
-		       : erts_remove_link(&dep->nlinks, lid));
-    }
-    erts_de_links_unlock(dep);
-}
-
-ERTS_GLB_INLINE int
-erts_was_dist_link_removed(ErtsDistLinkData *dldp)
-{
-    return dldp->d_sub_lnk != NULL;
-}
-
-ERTS_GLB_INLINE void
-erts_destroy_dist_link(ErtsDistLinkData *dldp)
-{
-    if (dldp->d_lnk)
-	erts_destroy_link(dldp->d_lnk);
-    if (dldp->d_sub_lnk)
-	erts_destroy_link(dldp->d_sub_lnk);	
-}
-
+#ifdef DEBUG
+#define ERTS_DBG_CHK_NO_DIST_LNK(D, R, L) \
+    erts_dbg_chk_no_dist_proc_link((D), (R), (L))
+#else
+#define ERTS_DBG_CHK_NO_DIST_LNK(D, R, L)
 #endif
-
-
 
 /* Define for testing */
 /* #define EXTREME_TTB_TRAPPING 1 */
@@ -328,6 +300,7 @@ typedef struct TTBSizeContext_ {
 
 typedef struct TTBEncodeContext_ {
     Uint flags;
+    Uint hopefull_flags;
     int level;
     byte* ep;
     Eterm obj;

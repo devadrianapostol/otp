@@ -61,8 +61,6 @@ static Export binary_longest_prefix_trap_export;
 static BIF_RETTYPE binary_longest_prefix_trap(BIF_ALIST_3);
 static Export binary_longest_suffix_trap_export;
 static BIF_RETTYPE binary_longest_suffix_trap(BIF_ALIST_3);
-static Export binary_bin_to_list_trap_export;
-static BIF_RETTYPE binary_bin_to_list_trap(BIF_ALIST_3);
 static Export binary_copy_trap_export;
 static BIF_RETTYPE binary_copy_trap(BIF_ALIST_2);
 static Uint max_loop_limit;
@@ -85,10 +83,6 @@ void erts_init_bif_binary(void)
     erts_init_trap_export(&binary_longest_suffix_trap_export,
 			  am_erlang, am_binary_longest_suffix_trap, 3,
 			  &binary_longest_suffix_trap);
-
-    erts_init_trap_export(&binary_bin_to_list_trap_export,
-			  am_erlang, am_binary_bin_to_list_trap, 3,
-			  &binary_bin_to_list_trap);
 
     erts_init_trap_export(&binary_copy_trap_export,
 			  am_erlang, am_binary_copy_trap, 2,
@@ -371,7 +365,7 @@ static ACTrie *create_acdata(MyAllocator *my, Uint len,
     acn->d = 0;
     acn->final = 0;
     acn->h = NULL;
-    memset(acn->g, 0, sizeof(ACNode *) * ALPHABET_SIZE);
+    sys_memset(acn->g, 0, sizeof(ACNode *) * ALPHABET_SIZE);
 #ifdef HARDDEBUG
     act->idc = 0;
     acn->id = 0;
@@ -394,7 +388,7 @@ static BMData *create_bmdata(MyAllocator *my, byte *x, Uint len,
     init_my_allocator(my, datasize, data);
     bmd = my_alloc(my, sizeof(BMData));
     bmd->x = my_alloc(my,len);
-    memcpy(bmd->x,x,len);
+    sys_memcpy(bmd->x,x,len);
     bmd->len = len;
     bmd->goodshift = my_alloc(my,sizeof(Uint) * len);
     *the_bin = mb;
@@ -439,7 +433,7 @@ static void ac_add_one_pattern(MyAllocator *my, ACTrie *act, byte *x, Uint len)
 	    nn->d = i+1;
 	    nn->h = act->root;
 	    nn->final = 0;
-	    memset(nn->g, 0, sizeof(ACNode *) * ALPHABET_SIZE);
+	    sys_memset(nn->g, 0, sizeof(ACNode *) * ALPHABET_SIZE);
 	    acn->g[x[i]] = nn;
 	    ++i;
 	    acn = nn;
@@ -2270,7 +2264,7 @@ static BIF_RETTYPE do_longest_common(Process *p, Eterm list, int direction)
 	    if (cd[i].type == CL_TYPE_HEAP_NOALLOC) {
 		unsigned char *tmp = cd[i].buff;
 		cd[i].buff = erts_alloc(ERTS_ALC_T_BINARY_BUFFER, cd[i].bufflen);
-		memcpy(cd[i].buff,tmp,cd[i].bufflen);
+		sys_memcpy(cd[i].buff,tmp,cd[i].bufflen);
 		cd[i].type = CL_TYPE_HEAP;
 	    }
 	}
@@ -2440,191 +2434,6 @@ BIF_RETTYPE binary_at_2(BIF_ALIST_2)
     BIF_ERROR(BIF_P,BADARG);
 }
 
-#define BIN_TO_LIST_OK 0
-#define BIN_TO_LIST_TRAP 1
-/* No badarg, checked before call */
-
-#define BIN_TO_LIST_LOOP_FACTOR 10
-
-static int do_bin_to_list(Process *p, byte *bytes, Uint bit_offs,
-			  Uint start, Sint *lenp, Eterm *termp)
-{
-    Uint reds = get_reds(p, BIN_TO_LIST_LOOP_FACTOR); /* reds can never be 0 */
-    Uint len = *lenp;
-    Uint loops;
-    Eterm *hp;
-    Eterm term = *termp;
-    Uint n;
-
-    ASSERT(reds > 0);
-
-    loops = MIN(reds,len);
-
-    BUMP_REDS(p, loops / BIN_TO_LIST_LOOP_FACTOR);
-
-    hp = HAlloc(p,2*loops);
-    while (loops--) {
-	--len;
-	if (bit_offs) {
-	    n = ((((Uint) bytes[start+len]) << bit_offs) |
-		 (((Uint) bytes[start+len+1]) >> (8-bit_offs))) & 0xFF;
-	} else {
-	    n = bytes[start+len];
-	}
-
-	term = CONS(hp,make_small(n),term);
-	hp +=2;
-    }
-    *termp = term;
-    *lenp = len;
-    if (len) {
-	BUMP_ALL_REDS(p);
-	return BIN_TO_LIST_TRAP;
-    }
-    return BIN_TO_LIST_OK;
-}
-
-
-static BIF_RETTYPE do_trap_bin_to_list(Process *p, Eterm binary,
-				       Uint start, Sint len, Eterm sofar)
-{
-    Eterm *hp;
-    Eterm blob;
-
-    hp = HAlloc(p,3);
-    hp[0] = make_pos_bignum_header(2);
-    hp[1] = start;
-    hp[2] = (Uint) len;
-    blob = make_big(hp);
-    BIF_TRAP3(&binary_bin_to_list_trap_export, p, binary, blob, sofar);
-}
-
-static BIF_RETTYPE binary_bin_to_list_trap(BIF_ALIST_3)
-{
-    Eterm *ptr;
-    Uint start;
-    Sint len;
-    byte *bytes;
-    Uint bit_offs;
-    Uint bit_size;
-    Eterm res = BIF_ARG_3;
-
-    ptr  = big_val(BIF_ARG_2);
-    start = ptr[1];
-    len = (Sint) ptr[2];
-
-    ERTS_GET_BINARY_BYTES(BIF_ARG_1,bytes,bit_offs,bit_size);
-    if (do_bin_to_list(BIF_P, bytes, bit_offs, start, &len, &res) ==
-	BIN_TO_LIST_OK) {
-	BIF_RET(res);
-    }
-    return do_trap_bin_to_list(BIF_P,BIF_ARG_1,start,len,res);
-}
-
-static BIF_RETTYPE binary_bin_to_list_common(Process *p,
-					     Eterm bin,
-					     Eterm epos,
-					     Eterm elen)
-{
-    Uint pos;
-    Sint len;
-    size_t sz;
-    byte *bytes;
-    Uint bit_offs;
-    Uint bit_size;
-    Eterm res = NIL;
-
-    if (is_not_binary(bin)) {
-	goto badarg;
-    }
-    if (!term_to_Uint(epos, &pos)) {
-	goto badarg;
-    }
-    if (!term_to_Sint(elen, &len)) {
-	goto badarg;
-    }
-    if (len < 0) {
-	Uint lentmp = -(Uint)len;
-	/* overflow */
-	if ((Sint)lentmp < 0) {
-	    goto badarg;
-	}
-	len = lentmp;
-	if (len > pos) {
-	    goto badarg;
-	}
-	pos -= len;
-    }
-    /* overflow */
-    if ((pos + len) < pos || (len > 0 && (pos + len) == pos)) {
-	goto badarg;
-    }
-    sz = binary_size(bin);
-
-    if (pos+len > sz) {
-	goto badarg;
-    }
-    ERTS_GET_BINARY_BYTES(bin,bytes,bit_offs,bit_size);
-    if (bit_size != 0) {
-	goto badarg;
-    }
-    if(do_bin_to_list(p, bytes, bit_offs, pos, &len, &res) ==
-       BIN_TO_LIST_OK) {
-	BIF_RET(res);
-    }
-    return do_trap_bin_to_list(p,bin,pos,len,res);
-
- badarg:
-    BIF_ERROR(p,BADARG);
-}
-
-BIF_RETTYPE binary_bin_to_list_3(BIF_ALIST_3)
-{
-    return binary_bin_to_list_common(BIF_P,BIF_ARG_1,BIF_ARG_2,BIF_ARG_3);
-}
-
-BIF_RETTYPE binary_bin_to_list_2(BIF_ALIST_2)
-{
-    Eterm *tp;
-
-    if (is_not_tuple(BIF_ARG_2)) {
-	goto badarg;
-    }
-    tp = tuple_val(BIF_ARG_2);
-    if (arityval(*tp) != 2) {
-	goto badarg;
-    }
-    return binary_bin_to_list_common(BIF_P,BIF_ARG_1,tp[1],tp[2]);
- badarg:
-    BIF_ERROR(BIF_P,BADARG);
-}
-
-BIF_RETTYPE binary_bin_to_list_1(BIF_ALIST_1)
-{
-    Uint pos = 0;
-    Sint len;
-    byte *bytes;
-    Uint bit_offs;
-    Uint bit_size;
-    Eterm res = NIL;
-
-    if (is_not_binary(BIF_ARG_1)) {
-	goto badarg;
-    }
-    len = binary_size(BIF_ARG_1);
-    ERTS_GET_BINARY_BYTES(BIF_ARG_1,bytes,bit_offs,bit_size);
-    if (bit_size != 0) {
-	goto badarg;
-    }
-    if(do_bin_to_list(BIF_P, bytes, bit_offs, pos, &len, &res) ==
-       BIN_TO_LIST_OK) {
-	BIF_RET(res);
-    }
-    return do_trap_bin_to_list(BIF_P,BIF_ARG_1,pos,len,res);
- badarg:
-    BIF_ERROR(BIF_P,BADARG);
-}
-
 HIPE_WRAPPER_BIF_DISABLE_GC(binary_list_to_bin, 1)
 
 BIF_RETTYPE binary_list_to_bin_1(BIF_ALIST_1)
@@ -2747,7 +2556,7 @@ static BIF_RETTYPE do_binary_copy(Process *p, Eterm bin, Eterm en)
 						    0);
 	    if (!(cbs->temp_alloc)) { /* alignment not needed, need to copy */
 		byte *tmp = erts_alloc(ERTS_ALC_T_BINARY_BUFFER,size);
-		memcpy(tmp,cbs->source,size);
+		sys_memcpy(tmp,cbs->source,size);
 		cbs->source = tmp;
 		cbs->source_type = BC_TYPE_HEAP;
 	    } else {
@@ -2760,7 +2569,7 @@ static BIF_RETTYPE do_binary_copy(Process *p, Eterm bin, Eterm en)
 	pos = 0;
 	i = 0;
 	while (pos < reds) {
-	    memcpy(t+pos,cbs->source, size);
+	    sys_memcpy(t+pos,cbs->source, size);
 	    pos += size;
 	    ++i;
 	}
@@ -2785,7 +2594,7 @@ static BIF_RETTYPE do_binary_copy(Process *p, Eterm bin, Eterm en)
 	}
 	pos = 0;
 	while (pos < target_size) {
-	    memcpy(t+pos,source, size);
+	    sys_memcpy(t+pos,source, size);
 	    pos += size;
 	}
 	erts_free_aligned_binary_bytes(temp_alloc);
@@ -2815,7 +2624,7 @@ BIF_RETTYPE binary_copy_trap(BIF_ALIST_2)
     if ((n-1) * size >= reds) {
 	Uint i = 0;
 	while ((pos - opos) < reds) {
-	    memcpy(t+pos,cbs->source, size);
+	    sys_memcpy(t+pos,cbs->source, size);
 	    pos += size;
 	    ++i;
 	}
@@ -2825,28 +2634,21 @@ BIF_RETTYPE binary_copy_trap(BIF_ALIST_2)
 	BIF_TRAP2(&binary_copy_trap_export, BIF_P, BIF_ARG_1, BIF_ARG_2);
     } else {
 	Binary *save;
-	ProcBin* pb;
+        Eterm resbin;
 	Uint target_size = cbs->result->orig_size;
 	while (pos < target_size) {
-	    memcpy(t+pos,cbs->source, size);
+	    sys_memcpy(t+pos,cbs->source, size);
 	    pos += size;
 	}
-	save =  cbs->result;
+	save = cbs->result;
 	cbs->result = NULL;
 	cleanup_copy_bin_state(mb); /* now cbs is dead */
-	pb = (ProcBin *) HAlloc(BIF_P, PROC_BIN_SIZE);
-	pb->thing_word = HEADER_PROC_BIN;
-	pb->size = target_size;
-	pb->next = MSO(BIF_P).first;
-	MSO(BIF_P).first = (struct erl_off_heap_header*) pb;
-	pb->val = save;
-	pb->bytes = t;
-	pb->flags = 0;
 
-	OH_OVERHEAD(&(MSO(BIF_P)), target_size / sizeof(Eterm));
-	BUMP_REDS(BIF_P,(pos - opos) / BINARY_COPY_LOOP_FACTOR);
-
-	BIF_RET(make_binary(pb));
+        resbin = erts_build_proc_bin(&MSO(BIF_P),
+                                     HAlloc(BIF_P, PROC_BIN_SIZE),
+                                     save);
+        BUMP_REDS(BIF_P,(pos - opos) / BINARY_COPY_LOOP_FACTOR);
+	BIF_RET(resbin);
     }
 }
 
@@ -3227,7 +3029,7 @@ static void dump_bm_data(BMData *bm)
 static void dump_ac_node(ACNode *node, int indent, int ch) {
     int i;
     char *spaces = erts_alloc(ERTS_ALC_T_TMP, 10 * indent + 1);
-    memset(spaces,' ',10*indent);
+    sys_memset(spaces,' ',10*indent);
     spaces[10*indent] = '\0';
     erts_printf("%s-> %c\n",spaces,ch);
     erts_printf("%sId: %u\n",spaces,(unsigned) node->id);

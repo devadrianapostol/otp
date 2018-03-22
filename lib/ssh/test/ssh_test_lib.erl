@@ -56,7 +56,9 @@ daemon(Host, Port, Options) ->
     ct:log("~p:~p Calling ssh:daemon(~p, ~p, ~p)",[?MODULE,?LINE,Host,Port,Options]),
     case ssh:daemon(Host, Port, Options) of
 	{ok, Pid} ->
-            {ok,L} = ssh:daemon_info(Pid),
+            R = ssh:daemon_info(Pid),
+            ct:log("~p:~p ssh:daemon_info(~p) ->~n ~p",[?MODULE,?LINE,Pid,R]),
+            {ok,L} = R,
             ListenPort = proplists:get_value(port, L),
             ListenIP = proplists:get_value(ip, L),
 	    {Pid, ListenIP, ListenPort};
@@ -199,15 +201,17 @@ init_io_server(TestCase) ->
 
 loop_io_server(TestCase, Buff0) ->
      receive
-	 {input, TestCase, Line} ->
+	 {input, TestCase, Line} = _INP ->
+             %%ct:log("io_server ~p:~p ~p got ~p",[?MODULE,?LINE,self(),_INP]),
 	     loop_io_server(TestCase, Buff0 ++ [Line]);
-	 {io_request, From, ReplyAs, Request} ->
+	 {io_request, From, ReplyAs, Request} = _REQ->
+             %%ct:log("io_server ~p:~p ~p got ~p",[?MODULE,?LINE,self(),_REQ]),
 	     {ok, Reply, Buff} = io_request(Request, TestCase, From,
 					    ReplyAs, Buff0),
 	     io_reply(From, ReplyAs, Reply),
 	     loop_io_server(TestCase, Buff);
 	 {'EXIT',_, _} = _Exit ->
-%%	     ct:log("ssh_test_lib:loop_io_server/2 got ~p",[_Exit]),
+	     ct:log("ssh_test_lib:loop_io_server/2 got ~p",[_Exit]),
 	     ok
     after 
 	30000 -> ct:fail("timeout ~p:~p",[?MODULE,?LINE])

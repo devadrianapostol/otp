@@ -1,7 +1,7 @@
 %%
 %% %CopyrightBegin%
 %% 
-%% Copyright Ericsson AB 1996-2017. All Rights Reserved.
+%% Copyright Ericsson AB 1996-2018. All Rights Reserved.
 %% 
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -310,6 +310,7 @@ add_apply_upgrade(Script,Args) ->
 %%                  RelVsn/start.boot
 %%                         relup
 %%                         sys.config
+%%                         sys.config.src
 %%         erts-EVsn[/bin]
 %%-----------------------------------------------------------------
 
@@ -1499,7 +1500,7 @@ mandatory_modules() ->
 preloaded() ->
     %% Sorted
     [erl_prim_loader,erl_tracer,erlang,
-     erts_code_purger,erts_dirty_process_code_checker,
+     erts_code_purger,erts_dirty_process_signal_handler,
      erts_internal,erts_literal_area_collector,
      init,otp_ring0,prim_buffer,prim_eval,prim_file,
      prim_inet,prim_zip,zlib].
@@ -1552,6 +1553,7 @@ create_kernel_procs(Appls) ->
 %%                  RelVsn/start.boot
 %%                         relup
 %%                         sys.config
+%%                         sys.config.src
 %%         erts-EVsn[/bin]
 %%
 %% The VariableN.tar.gz files can also be stored as own files not
@@ -1707,14 +1709,18 @@ add_system_files(Tar, RelName, Release, Path1) ->
 	    add_to_tar(Tar, Relup, filename:join(RelVsnDir, "relup"))
     end,
 
-    case lookup_file("sys.config", Path) of
-	false ->
-	    ignore;
-	Sys ->
-	    check_sys_config(Sys),
-	    add_to_tar(Tar, Sys, filename:join(RelVsnDir, "sys.config"))
+    case lookup_file("sys.config.src", Path) of
+        false ->
+            case lookup_file("sys.config", Path) of
+                false ->
+                    ignore;
+                Sys ->
+	            check_sys_config(Sys),
+	            add_to_tar(Tar, Sys, filename:join(RelVsnDir, "sys.config"))
+            end;
+        SysSrc ->
+            add_to_tar(Tar, SysSrc, filename:join(RelVsnDir, "sys.config.src"))
     end,
-    
     ok.
 
 lookup_file(Name, [Dir|Path]) ->

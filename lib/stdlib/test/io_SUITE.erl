@@ -1,7 +1,7 @@
 %%
 %% %CopyrightBegin%
 %% 
-%% Copyright Ericsson AB 1999-2017. All Rights Reserved.
+%% Copyright Ericsson AB 1999-2018. All Rights Reserved.
 %% 
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -714,7 +714,7 @@ p(Term, D) ->
     rp(Term, 1, 80, D).
 
 p(Term, Col, Ll, D) ->
-    rp(Term, Col, Ll, D, no_fun).
+    rp(Term, Col, Ll, D, none).
 
 rp(Term, Col, Ll, D) ->
     rp(Term, Col, Ll, D, fun rfd/2).
@@ -724,6 +724,8 @@ rp(Term, Col, Ll, D) ->
 rp(Term, Col, Ll, D, RF) ->
     rp(Term, Col, Ll, D, ?MAXCS, RF).
 
+rp(Term, Col, Ll, D, M, none) ->
+    rp(Term, Col, Ll, D, M, fun(_, _) -> no end);
 rp(Term, Col, Ll, D, M, RF) ->
     %% io:format("~n~n*** Col = ~p Ll = ~p D = ~p~n~p~n-->~n", 
     %%           [Col, Ll, D, Term]),
@@ -1903,29 +1905,61 @@ otp_10836(Suite) when is_list(Suite) ->
 
 %% OTP-10755. The 'l' modifier
 otp_10755(Suite) when is_list(Suite) ->
+    %% printing plain ascii characters
     S = "string",
     "\"string\"" = fmt("~p", [S]),
     "[115,116,114,105,110,103]" = fmt("~lp", [S]),
     "\"string\"" = fmt("~P", [S, 2]),
     "[115|...]" = fmt("~lP", [S, 2]),
-    {'EXIT',{badarg,_}} = (catch fmt("~ltp", [S])),
-    {'EXIT',{badarg,_}} = (catch fmt("~tlp", [S])),
-    {'EXIT',{badarg,_}} = (catch fmt("~ltP", [S])),
-    {'EXIT',{badarg,_}} = (catch fmt("~tlP", [S])),
+    %% printing latin1 chars, with and without modifiers
+    T = {[255],list_to_atom([255]),[a,b,c]},
+    "{\"ÿ\",ÿ,[a,b,c]}" = fmt("~p", [T]),
+    "{\"ÿ\",ÿ,[a,b,c]}" = fmt("~tp", [T]),
+    "{[255],ÿ,[a,b,c]}" = fmt("~lp", [T]),
+    "{[255],ÿ,[a,b,c]}" = fmt("~ltp", [T]),
+    "{[255],ÿ,[a,b,c]}" = fmt("~tlp", [T]),
+    "{\"ÿ\",ÿ,...}" = fmt("~P", [T,3]),
+    "{\"ÿ\",ÿ,...}" = fmt("~tP", [T,3]),
+    "{[255],ÿ,...}" = fmt("~lP", [T,3]),
+    "{[255],ÿ,...}" = fmt("~ltP", [T,3]),
+    "{[255],ÿ,...}" = fmt("~tlP", [T,3]),
+    %% printing unicode chars, with and without modifiers
+    U = {[666],list_to_atom([666]),[a,b,c]},
+    "{[666],'\\x{29A}',[a,b,c]}" = fmt("~p", [U]),
+    case io:printable_range() of
+        unicode ->
+            "{\"ʚ\",'ʚ',[a,b,c]}" = fmt("~tp", [U]),
+            "{\"ʚ\",'ʚ',...}" = fmt("~tP", [U,3]);
+        latin1 ->
+            "{[666],'ʚ',[a,b,c]}" = fmt("~tp", [U]),
+            "{[666],'ʚ',...}" = fmt("~tP", [U,3])
+    end,
+    "{[666],'\\x{29A}',[a,b,c]}" = fmt("~lp", [U]),
+    "{[666],'ʚ',[a,b,c]}" = fmt("~ltp", [U]),
+    "{[666],'ʚ',[a,b,c]}" = fmt("~tlp", [U]),
+    "{[666],'\\x{29A}',...}" = fmt("~P", [U,3]),
+    "{[666],'\\x{29A}',...}" = fmt("~lP", [U,3]),
+    "{[666],'ʚ',...}" = fmt("~ltP", [U,3]),
+    "{[666],'ʚ',...}" = fmt("~tlP", [U,3]),
+    %% the compiler should catch uses of ~l with other than pP
     Text =
         "-module(l_mod).\n"
         "-export([t/0]).\n"
         "t() ->\n"
         "    S = \"string\",\n"
-        "    io:format(\"~ltp\", [S]),\n"
-        "    io:format(\"~tlp\", [S]),\n"
-        "    io:format(\"~ltP\", [S, 1]),\n"
-        "    io:format(\"~tlP\", [S, 1]).\n",
+        "    io:format(\"~lw\", [S]),\n"
+        "    io:format(\"~lW\", [S, 1]),\n"
+        "    io:format(\"~ltw\", [S]),\n"
+        "    io:format(\"~tlw\", [S]),\n"
+        "    io:format(\"~ltW\", [S, 1]),\n"
+        "    io:format(\"~tlW\", [S, 1]).\n",
     {ok,l_mod,[{_File,Ws}]} = compile_file("l_mod.erl", Text, Suite),
-    ["format string invalid (invalid control ~lt)",
-     "format string invalid (invalid control ~tl)",
-     "format string invalid (invalid control ~lt)",
-     "format string invalid (invalid control ~tl)"] =
+    ["format string invalid (invalid control ~lw)",
+     "format string invalid (invalid control ~lW)",
+     "format string invalid (invalid control ~ltw)",
+     "format string invalid (invalid control ~ltw)",
+     "format string invalid (invalid control ~ltW)",
+     "format string invalid (invalid control ~ltW)"] =
         [lists:flatten(M:format_error(E)) || {_L,M,E} <- Ws],
     ok.
 
@@ -2003,6 +2037,7 @@ writes(N, F1) ->
 
 format_string(_Config) ->
     %% All but padding is tested by fmt/2.
+    "xxxxxxxsss" = fmt("~10..xs", ["sss"]),
     "xxxxxxsssx" = fmt("~10.4.xs", ["sss"]),
     "xxxxxxsssx" = fmt("~10.4.*s", [$x, "sss"]),
     ok.
@@ -2382,19 +2417,36 @@ limit_term(_Config) ->
     {_, 2} = limt({a,b,c,[d,e]}, 2),
     {_, 2} = limt({a,b,c,[d,e]}, 3),
     {_, 2} = limt({a,b,c,[d,e]}, 4),
+    T0 = [1|{a,b,c}],
+    {_, 2} = limt(T0, 2),
+    {_, 2} = limt(T0, 3),
+    {_, 2} = limt(T0, 4),
     {_, 1} = limt(<<"foo">>, 18),
+    {_, 2} = limt({"",[1,2]}, 3),
+    {_, 2} = limt({"",{1,2}}, 3),
+    true = limt_pp({"123456789012345678901234567890",{1,2}}, 3),
     ok = blimt(<<"123456789012345678901234567890">>),
+    true = limt_pp(<<"123456789012345678901234567890">>, 3),
+    {_, 2} = limt({<<"kljlkjsl">>,[1,2,3,4]}, 4),
     {_, 1} = limt(<<7:3>>, 2),
     {_, 1} = limt(<<7:21>>, 2),
     {_, 1} = limt([], 2),
     {_, 1} = limt({}, 2),
+    {_, 1} = limt({"", ""}, 4),
     {_, 1} = limt(#{}, 2),
-    {_, 1} = limt(#{[] => {}}, 2),
+    {_, 2} = limt(#{[] => {}}, 1),
+    {_, 2} = limt(#{[] => {}}, 2),
     {_, 1} = limt(#{[] => {}}, 3),
     T = #{[] => {},[a] => [b]},
-    {_, 1} = limt(T, 2),
+    {_, 1} = limt(T, 0),
+    {_, 2} = limt(T, 1),
+    {_, 2} = limt(T, 2),
     {_, 1} = limt(T, 3),
     {_, 1} = limt(T, 4),
+    T2 = #{[] => {},{} => []},
+    {_, 2} = limt(T2, 1),
+    {_, 2} = limt(T2, 2),
+    {_, 1} = limt(T2, 3),
     ok.
 
 blimt(Binary) ->
@@ -2428,3 +2480,12 @@ limt(Term, Depth) when is_integer(Depth) ->
 
 form(Term, Depth) ->
     lists:flatten(io_lib:format("~W", [Term, Depth])).
+
+limt_pp(Term, Depth) when is_integer(Depth) ->
+    T1 = io_lib:limit_term(Term, Depth),
+    S = pp(Term, Depth),
+    S1 = pp(T1, Depth),
+    S1 =:= S.
+
+pp(Term, Depth) ->
+    lists:flatten(io_lib:format("~P", [Term, Depth])).

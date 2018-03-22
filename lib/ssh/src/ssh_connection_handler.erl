@@ -1168,23 +1168,30 @@ handle_event({call,From}, stop, StateName, D0) ->
     {Repls,D} = send_replies(Replies, D0),
     {stop_and_reply, normal, [{reply,From,ok}|Repls], D#data{connection_state=Connection}};
 
-
 handle_event({call,_}, _, StateName, _) when not ?CONNECTED(StateName) ->
     {keep_state_and_data, [postpone]};
 
 handle_event({call,From}, {request, ChannelPid, ChannelId, Type, Data, Timeout}, StateName, D0) 
   when ?CONNECTED(StateName) ->
-    D = handle_request(ChannelPid, ChannelId, Type, Data, true, From, D0),
-    %% Note reply to channel will happen later when reply is recived from peer on the socket
-    start_channel_request_timer(ChannelId, From, Timeout),
-    {keep_state, cache_request_idle_timer_check(D)};
+    case handle_request(ChannelPid, ChannelId, Type, Data, true, From, D0) of
+        {error,Error} ->
+            {keep_state, D0, {reply,From,{error,Error}}};
+        D ->
+            %% Note reply to channel will happen later when reply is recived from peer on the socket
+            start_channel_request_timer(ChannelId, From, Timeout),
+            {keep_state, cache_request_idle_timer_check(D)}
+    end;
 
 handle_event({call,From}, {request, ChannelId, Type, Data, Timeout}, StateName, D0) 
   when ?CONNECTED(StateName) ->
-    D = handle_request(ChannelId, Type, Data, true, From, D0),
-    %% Note reply to channel will happen later when reply is recived from peer on the socket
-    start_channel_request_timer(ChannelId, From, Timeout),
-    {keep_state, cache_request_idle_timer_check(D)};
+    case handle_request(ChannelId, Type, Data, true, From, D0) of
+        {error,Error} ->
+            {keep_state, D0, {reply,From,{error,Error}}};
+        D ->
+            %% Note reply to channel will happen later when reply is recived from peer on the socket
+            start_channel_request_timer(ChannelId, From, Timeout),
+            {keep_state, cache_request_idle_timer_check(D)}
+    end;
 
 handle_event({call,From}, {data, ChannelId, Type, Data, Timeout}, StateName, D0) 
   when ?CONNECTED(StateName) ->
@@ -1442,38 +1449,43 @@ handle_event(Type, Ev, StateName, D) ->
 -spec terminate(any(),
 		state_name(),
 		#data{}
-	       ) -> finalize_termination_result() .
+	       ) -> term().
 			
 %% . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . . .
 
 terminate(normal, StateName, State) ->
-    finalize_termination(StateName, State);
+    stop_subsystem(State),
+    close_transport(State);
 
 terminate({shutdown,{init,Reason}}, StateName, State) ->
     error_logger:info_report(io_lib:format("Erlang ssh in connection handler init: ~p~n",[Reason])),
-    finalize_termination(StateName, State);
+    stop_subsystem(State),
+    close_transport(State);
 
 terminate(shutdown, StateName, State0) ->
     %% Terminated by supervisor
     State = send_msg(#ssh_msg_disconnect{code = ?SSH_DISCONNECT_BY_APPLICATION,
-					 description = "Application shutdown"},
-		     State0),
-    finalize_termination(StateName, State);
-
-%% terminate({shutdown,Msg}, StateName, State0) when is_record(Msg,ssh_msg_disconnect)->
-%%     State = send_msg(Msg, State0),
-%%     finalize_termination(StateName, Msg, State);
+                                         description = "Application shutdown"},
+                     State0),
+    close_transport(State);
 
 terminate({shutdown,_R}, StateName, State) ->
-    finalize_termination(StateName, State);
+    %% Internal termination
+    stop_subsystem(State),
+    close_transport(State);
+
+terminate(kill, StateName, State) ->
+    stop_subsystem(State),
+    close_transport(State);
 
 terminate(Reason, StateName, State0) ->
     %% Others, e.g  undef, {badmatch,_}
     log_error(Reason),
     State = send_msg(#ssh_msg_disconnect{code = ?SSH_DISCONNECT_BY_APPLICATION,
-					   description = "Internal error"},
+                                         description = "Internal error"},
 		     State0),
-    finalize_termination(StateName, State).
+    stop_subsystem(State),
+    close_transport(State).
 
 %%--------------------------------------------------------------------
 
@@ -1548,20 +1560,24 @@ start_the_connection_child(UserPid, Role, Socket, Options0) ->
 
 %%--------------------------------------------------------------------
 %% Stopping
--type finalize_termination_result() :: ok .
 
-finalize_termination(_StateName, #data{transport_cb = Transport,
-				       connection_state = Connection,
-				       socket = Socket}) ->
-    case Connection of
-	#connection{system_supervisor = SysSup,
-		    sub_system_supervisor = SubSysSup} when is_pid(SubSysSup) ->
-	    ssh_system_sup:stop_subsystem(SysSup, SubSysSup);
-	_ ->
-	    do_nothing
-    end,
-    (catch Transport:close(Socket)),
+stop_subsystem(#data{connection_state =
+                         #connection{system_supervisor = SysSup,
+                                     sub_system_supervisor = SubSysSup}}) when is_pid(SubSysSup) ->
+    ssh_system_sup:stop_subsystem(SysSup, SubSysSup);
+stop_subsystem(_) ->
     ok.
+
+
+close_transport(#data{transport_cb = Transport,
+                      socket = Socket}) ->
+    try
+        Transport:close(Socket)
+    of
+        _ -> ok
+    catch
+        _:_ -> ok
+    end.
 
 %%--------------------------------------------------------------------
 %% "Invert" the Role
@@ -1774,21 +1790,31 @@ is_usable_user_pubkey(A, Ssh) ->
 %%%----------------------------------------------------------------
 handle_request(ChannelPid, ChannelId, Type, Data, WantReply, From, D) ->
     case ssh_channel:cache_lookup(cache(D), ChannelId) of
-	#channel{remote_id = Id} = Channel ->
+	#channel{remote_id = Id,
+                 sent_close = false} = Channel ->
 	    update_sys(cache(D), Channel, Type, ChannelPid),
 	    send_msg(ssh_connection:channel_request_msg(Id, Type, WantReply, Data),
 		     add_request(WantReply, ChannelId, From, D));
-	undefined ->
-	    D
+
+        _ when WantReply==true ->
+            {error,closed};
+
+        _ ->
+            D
     end.
 
 handle_request(ChannelId, Type, Data, WantReply, From, D) ->
     case ssh_channel:cache_lookup(cache(D), ChannelId) of
-	#channel{remote_id = Id} ->
+	#channel{remote_id = Id,
+                 sent_close = false} ->
 	    send_msg(ssh_connection:channel_request_msg(Id, Type, WantReply, Data),
 		     add_request(WantReply, ChannelId, From, D));
-	undefined ->
-	    D
+
+	_ when WantReply==true ->
+            {error,closed};
+        
+        _ ->
+            D
     end.
 
 %%%----------------------------------------------------------------

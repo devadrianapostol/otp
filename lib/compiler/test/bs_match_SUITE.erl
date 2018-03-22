@@ -40,7 +40,7 @@
 	 map_and_binary/1,unsafe_branch_caching/1,
 	 bad_literals/1,good_literals/1,constant_propagation/1,
 	 parse_xml/1,get_payload/1,escape/1,num_slots_different/1,
-         check_bitstring_list/1,guard/1]).
+         beam_bsm/1,guard/1,is_ascii/1,non_opt_eq/1]).
 
 -export([coverage_id/1,coverage_external_ignore/2]).
 
@@ -73,7 +73,7 @@ groups() ->
        map_and_binary,unsafe_branch_caching,
        bad_literals,good_literals,constant_propagation,parse_xml,
        get_payload,escape,num_slots_different,
-       check_bitstring_list,guard]}].
+       beam_bsm,guard,is_ascii,non_opt_eq]}].
 
 
 init_per_suite(Config) ->
@@ -678,6 +678,10 @@ coverage(Config) when is_list(Config) ->
     <<>> = coverage_per_key(<<4:32>>),
     <<$a,$b,$c>> = coverage_per_key(<<7:32,"abc">>),
 
+    binary = coverage_bitstring(<<>>),
+    binary = coverage_bitstring(<<7>>),
+    bitstring = coverage_bitstring(<<7:4>>),
+    other = coverage_bitstring([a]),
     ok.
 
 coverage_fold(Fun, Acc, <<H,T/binary>>) ->
@@ -768,6 +772,10 @@ coverage_per_key(<<BinSize:32,Bin/binary>> = B) ->
     true = (byte_size(B) =:= BinSize),
     Bin.
 
+coverage_bitstring(Bin) when is_binary(Bin) -> binary;
+coverage_bitstring(<<_/bitstring>>) -> bitstring;
+coverage_bitstring(_) -> other.
+
 multiple_uses(Config) when is_list(Config) ->
     {344,62879,345,<<245,159,1,89>>} = multiple_uses_1(<<1,88,245,159,1,89>>),
     true = multiple_uses_2(<<0,0,197,18>>),
@@ -801,7 +809,7 @@ multiple_uses_cmp(<<_:16>>, <<_:16>>) -> false.
 first_after(Data, Offset) ->
     case byte_size(Data) > Offset of
 	false ->
-	    {First, Rest} = {ok, ok},
+	    {_First, _Rest} = {ok, ok},
 	    ok;
 	true ->
 	    <<_:Offset/binary, Rest/binary>> = Data,
@@ -1515,7 +1523,7 @@ is_next_char_whitespace(<<C/utf8,_/binary>>) ->
         {this_hdr = 17,
          ext_hdr_opts}).
 
-get_payload(Config) ->
+get_payload(_Config) ->
     <<3445:48>> = do_get_payload(#ext_header{ext_hdr_opts = <<3445:48>>}),
     {'EXIT',_} = (catch do_get_payload(#ext_header{})),
     ok.
@@ -1574,10 +1582,22 @@ lgettext(<<"de">>, <<"navigation">>, <<"Results">>) ->
 lgettext(<<"de">>, <<"navigation">>, <<"Resources">>) ->
     {ok, <<"Ressourcen">>}.
 
-%% Cover more code in beam_bsm.
-check_bitstring_list(_Config) ->
+%% Test more code in beam_bsm.
+beam_bsm(_Config) ->
     true = check_bitstring_list(<<1:1,0:1,1:1,1:1>>, [1,0,1,1]),
     false = check_bitstring_list(<<1:1,0:1,1:1,1:1>>, [0]),
+
+    true = bsm_validate_scheme(<<>>),
+    true = bsm_validate_scheme(<<5,10>>),
+    false = bsm_validate_scheme(<<5,10,11,12>>),
+    true = bsm_validate_scheme([]),
+    true = bsm_validate_scheme([5,10]),
+    false = bsm_validate_scheme([5,6,7]),
+
+    <<1,2,3>> = bsm_must_save_and_not_save(<<1,2,3>>, []),
+    D = fun(N) -> 2*N end,
+    [2,4|<<3>>] = bsm_must_save_and_not_save(<<1,2,3>>, [D,D]),
+
     ok.
 
 check_bitstring_list(<<H:1,T1/bitstring>>, [H|T2]) ->
@@ -1587,8 +1607,32 @@ check_bitstring_list(<<>>, []) ->
 check_bitstring_list(_, _) ->
     false.
 
+bsm_validate_scheme([]) -> true;
+bsm_validate_scheme([H|T]) ->
+    case bsm_is_scheme(H) of
+        true -> bsm_validate_scheme(T);
+        false -> false
+    end;
+bsm_validate_scheme(<<>>) -> true;
+bsm_validate_scheme(<<H, Rest/binary>>) ->
+    case bsm_is_scheme(H) of
+        true -> bsm_validate_scheme(Rest);
+        false -> false
+    end.
+
+bsm_is_scheme(Int) ->
+    Int rem 5 =:= 0.
+
+%% NOT OPTIMIZED: different control paths use different positions in the binary
+bsm_must_save_and_not_save(Bin, []) ->
+    Bin;
+bsm_must_save_and_not_save(<<H,T/binary>>, [F|Fs]) ->
+    [F(H)|bsm_must_save_and_not_save(T, Fs)];
+bsm_must_save_and_not_save(<<>>, []) ->
+    [].
+
 guard(_Config) ->
-    Tuple = id({a,b}),
+    _Tuple = id({a,b}),
     ok = guard_1(<<1,2,3>>, {1,2,3}),
     ok = guard_2(<<42>>, #{}),
     ok.
@@ -1600,6 +1644,39 @@ guard_1(<<A,B,C>>, Tuple) when Tuple =:= {A,B,C} ->
 %% Cover handling of #k_call{} in v3_codegen:bsm_rename_ctx/4.
 guard_2(<<_>>, Healing) when Healing#{[] => Healing} =:= #{[] => #{}} ->
     ok.
+
+is_ascii(_Config) ->
+    true = do_is_ascii(<<>>),
+    true = do_is_ascii(<<"string">>),
+    false = do_is_ascii(<<1024/utf8>>),
+    {'EXIT',{function_clause,_}} = (catch do_is_ascii(<<$A,0:3>>)),
+    {'EXIT',{function_clause,_}} = (catch do_is_ascii(<<16#80,0:3>>)),
+    ok.
+
+do_is_ascii(<<>>) ->
+    true;
+do_is_ascii(<<C,_/binary>>) when C >= 16#80 ->
+    %% This clause must fail to match if the size of the argument in
+    %% bits is not divisible by 8. Beware of unsafe optimizations.
+    false;
+do_is_ascii(<<_, T/binary>>) ->
+    do_is_ascii(T).
+
+non_opt_eq(_Config) ->
+    true = non_opt_eq([], <<>>),
+    true = non_opt_eq([$a], <<$a>>),
+    false = non_opt_eq([$a], <<$b>>),
+    ok.
+
+%% An example from the Efficiency Guide. It used to be not optimized,
+%% but now it can be optimized.
+
+non_opt_eq([H|T1], <<H,T2/binary>>) ->
+    non_opt_eq(T1, T2);
+non_opt_eq([_|_], <<_,_/binary>>) ->
+    false;
+non_opt_eq([], <<>>) ->
+    true.
 
 check(F, R) ->
     R = F().

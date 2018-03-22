@@ -1025,43 +1025,49 @@ string_regex_filter(_Str, _Search) ->
     false.
 
 anonymous_suites(Version) ->
-    [ssl_cipher:erl_suite_definition(S) || S <- ssl_cipher:filter_suites(ssl_cipher:anonymous_suites(Version))].
-
+    ssl:filter_cipher_suites([ssl_cipher:suite_definition(S) || S <- ssl_cipher:anonymous_suites(Version)],[]).
 psk_suites(Version) ->
-    [ssl_cipher:erl_suite_definition(S) || S <-  ssl_cipher:filter_suites(ssl_cipher:psk_suites(Version))].
+    ssl:filter_cipher_suites([ssl_cipher:suite_definition(S) || S <- ssl_cipher:psk_suites(Version)], []).
 
 psk_anon_suites(Version) ->
-    [Suite || Suite <-  psk_suites(Version), is_psk_anon_suite(Suite)].
+    ssl:filter_cipher_suites([ssl_cipher:suite_definition(S) || S <- ssl_cipher:psk_suites_anon(Version)], 
+                             [{key_exchange, 
+                               fun(psk) -> 
+                                       true;
+                                  (psk_dhe) -> 
+                                       true;
+                                  (_) -> 
+                                       false 
+                               end}]).
 
 srp_suites() ->
-    [ssl_cipher:erl_suite_definition(Suite) || 
-        Suite  <-
-            ssl_cipher:filter_suites([tuple_to_map(S) || 
-                                         S <- [{srp_anon,'3des_ede_cbc', sha},
-                                               {srp_rsa, '3des_ede_cbc', sha},
-                                               {srp_anon, aes_128_cbc, sha},
-                                               {srp_rsa, aes_128_cbc, sha},
-                                               {srp_anon, aes_256_cbc, sha},
-                                               {srp_rsa, aes_256_cbc, sha}]])].
+    ssl:filter_cipher_suites([ssl_cipher:suite_definition(S) || S <- ssl_cipher:srp_suites()],
+                             [{key_exchange, 
+                               fun(srp_rsa) -> 
+                                       true;
+                                  (_) -> 
+                                       false 
+                               end}]).
 srp_anon_suites() ->
-    [ssl_cipher:erl_suite_definition(Suite) || 
-        Suite  <-
-            ssl_cipher:filter_suites([tuple_to_map(S) || 
-                                         S <-[{srp_anon, '3des_ede_cbc', sha},
-                                              {srp_anon, aes_128_cbc, sha},
-                                              {srp_anon, aes_256_cbc, sha}]])].
+    ssl:filter_cipher_suites([ssl_cipher:suite_definition(S) || S <-  ssl_cipher:srp_suites_anon()],
+                             []).
 srp_dss_suites() ->
-    [ssl_cipher:erl_suite_definition(Suite) || 
-        Suite  <-
-            ssl_cipher:filter_suites([tuple_to_map(S) || 
-                                         S <-	[{srp_dss, '3des_ede_cbc', sha},
-                                                 {srp_dss, aes_128_cbc, sha},
-                                                 {srp_dss, aes_256_cbc, sha}]])].
+    ssl:filter_cipher_suites([ssl_cipher:suite_definition(S) || S <- ssl_cipher:srp_suites()], 
+                             [{key_exchange, 
+                               fun(srp_dss) -> 
+                                       true;
+                                  (_) -> 
+                                       false 
+                               end}]).
+chacha_suites(Version) ->
+    [ssl_cipher:erl_suite_definition(S) || S <- ssl_cipher:filter_suites(ssl_cipher:chacha_suites(Version))].
+
+
 rc4_suites(Version) ->
-    [ssl_cipher:erl_suite_definition(S) || S <- ssl_cipher:filter_suites(ssl_cipher:rc4_suites(Version))].
+     ssl:filter_cipher_suites([ssl_cipher:suite_definition(S) || S <-ssl_cipher:rc4_suites(Version)], []).
 
 des_suites(Version) ->
-    [ssl_cipher:erl_suite_definition(S) || S <- ssl_cipher:filter_suites(ssl_cipher:des_suites(Version))].
+     ssl:filter_cipher_suites([ssl_cipher:suite_definition(S) || S <-ssl_cipher:des_suites(Version)], []).
 
 tuple_to_map({Kex, Cipher, Mac}) ->
     #{key_exchange => Kex,
@@ -1298,6 +1304,32 @@ cipher_restriction(Config0) ->
 	    Config0
     end.
 
+openssl_dsa_support() ->
+    case os:cmd("openssl version") of
+        "LibreSSL 2.6.1" ++ _ ->
+            true;
+        "LibreSSL 2.6.2" ++ _ ->
+            true;
+        "LibreSSL 2.6" ++ _ ->
+            false;
+        "LibreSSL 2.4" ++ _ ->
+            true;
+        "LibreSSL 2.3" ++ _ ->
+            true;
+        "LibreSSL 2.2" ++ _ ->
+            true;
+        "LibreSSL 2.1" ++ _ ->
+            true;
+        "LibreSSL 2.0" ++ _ ->
+            true;
+        "LibreSSL"  ++ _ ->
+            false;
+        "OpenSSL 1.0.1" ++ Rest ->
+            hd(Rest) >= s;
+        _ ->
+            true
+    end.
+
 check_sane_openssl_version(Version) ->
     case supports_ssl_tls_version(Version) of 
 	true ->
@@ -1335,8 +1367,9 @@ enough_openssl_crl_support(_) -> true.
 
 wait_for_openssl_server(Port, tls) ->
     do_wait_for_openssl_tls_server(Port, 10);
-wait_for_openssl_server(Port, dtls) ->
-    do_wait_for_openssl_dtls_server(Port, 10).
+wait_for_openssl_server(_Port, dtls) ->
+    ok. %% No need to wait for DTLS over UDP server
+        %% client will retransmitt until it is up.
 
 do_wait_for_openssl_tls_server(_, 0) ->
     exit(failed_to_connect_to_openssl);
@@ -1348,21 +1381,6 @@ do_wait_for_openssl_tls_server(Port, N) ->
 	    ct:sleep(?SLEEP),
 	    do_wait_for_openssl_tls_server(Port, N-1)
     end.
-
-do_wait_for_openssl_dtls_server(_, 0) ->
-    %%exit(failed_to_connect_to_openssl);
-    ok;
-do_wait_for_openssl_dtls_server(Port, N) ->
-    %% case gen_udp:open(0) of
-    %%     {ok, S} ->
-    %%         gen_udp:connect(S, "localhost", Port),
-    %%         gen_udp:close(S);
-    %%     _  ->
-    %%         ct:sleep(?SLEEP),
-    %%         do_wait_for_openssl_dtls_server(Port, N-1)
-    %% end.
-    ct:sleep(500),
-    do_wait_for_openssl_dtls_server(Port, N-1).
 
 version_flag(tlsv1) ->
     "-tls1";
@@ -1390,7 +1408,9 @@ filter_suites(Ciphers0, AtomVersion) ->
     Supported0 = ssl_cipher:suites(Version)
 	++ ssl_cipher:anonymous_suites(Version)
 	++ ssl_cipher:psk_suites(Version)
+        ++ ssl_cipher:psk_suites_anon(Version)
 	++ ssl_cipher:srp_suites() 
+        ++ ssl_cipher:srp_suites_anon() 
 	++ ssl_cipher:rc4_suites(Version),
     Supported1 = ssl_cipher:filter_suites(Supported0),
     Supported2 = [ssl_cipher:erl_suite_definition(S) || S <- Supported1],
@@ -1663,79 +1683,4 @@ hardcode_dsa_key(3) ->
        g =  20302424198893709525243209250470907105157816851043773596964076323184805650258390738340248469444700378962907756890306095615785481696522324901068493502141775433048117442554163252381401915027666416630898618301033737438756165023568220631119672502120011809327566543827706483229480417066316015458225612363927682579,
        y =  48598545580251057979126570873881530215432219542526130654707948736559463436274835406081281466091739849794036308281564299754438126857606949027748889019480936572605967021944405048011118039171039273602705998112739400664375208228641666852589396502386172780433510070337359132965412405544709871654840859752776060358,
        x = 1457508827177594730669011716588605181448418352823}.
-
-dtls_hello() ->
-    [1,
-     <<0,1,4>>,
-     <<0,0>>,
-     <<0,0,0>>,
-     <<0,1,4>>,
-     <<254,253,88,
-       156,129,61,
-       131,216,15,
-       131,194,242,
-       46,154,190,
-       20,228,234,
-       234,150,44,
-       62,96,96,103,
-       127,95,103,
-       23,24,42,138,
-       13,142,32,57,
-       230,177,32,
-       210,154,152,
-       188,121,134,
-       136,53,105,
-       118,96,106,
-       103,231,223,
-       133,10,165,
-       50,32,211,
-       227,193,14,
-       181,143,48,
-       66,0,0,100,0,
-       255,192,44,
-       192,48,192,
-       36,192,40,
-       192,46,192,
-       50,192,38,
-       192,42,0,159,
-       0,163,0,107,
-       0,106,0,157,
-       0,61,192,43,
-       192,47,192,
-       35,192,39,
-       192,45,192,
-       49,192,37,
-       192,41,0,158,
-       0,162,0,103,
-       0,64,0,156,0,
-       60,192,10,
-       192,20,0,57,
-       0,56,192,5,
-       192,15,0,53,
-       192,8,192,18,
-       0,22,0,19,
-       192,3,192,13,
-       0,10,192,9,
-       192,19,0,51,
-       0,50,192,4,
-       192,14,0,47,
-       1,0,0,86,0,0,
-       0,14,0,12,0,
-       0,9,108,111,
-       99,97,108,
-       104,111,115,
-       116,0,10,0,
-       58,0,56,0,14,
-       0,13,0,25,0,
-       28,0,11,0,12,
-       0,27,0,24,0,
-       9,0,10,0,26,
-       0,22,0,23,0,
-       8,0,6,0,7,0,
-       20,0,21,0,4,
-       0,5,0,18,0,
-       19,0,1,0,2,0,
-       3,0,15,0,16,
-       0,17,0,11,0,
-       2,1,0>>].
 

@@ -1,7 +1,7 @@
 /*
  * %CopyrightBegin%
  *
- * Copyright Ericsson AB 1998-2017. All Rights Reserved.
+ * Copyright Ericsson AB 1998-2018. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -38,6 +38,7 @@
 #include "erl_binary.h"
 #include "erl_map.h"
 #include "erl_thr_progress.h"
+#include "erl_proc_sig_queue.h"
 
 #include "erl_db_util.h"
 
@@ -74,12 +75,35 @@ DBIF_TABLE_GUARD | DBIF_TABLE_BODY | DBIF_TRACE_GUARD | DBIF_TRACE_BODY
 typedef struct DMC_STACK_TYPE(Type) {		\
     int pos;					\
     int siz;					\
-    Type def[DMC_DEFAULT_SIZE];		        \
+    int bytes;                                  \
     Type *data;					\
+    Type def[DMC_DEFAULT_SIZE];		        \
 } DMC_STACK_TYPE(Type)
+
+
+typedef int Dummy;
+DMC_DECLARE_STACK_TYPE(Dummy);
+
+static void dmc_stack_grow(DMC_Dummy_stack* s)
+{
+    int was_bytes = s->bytes;
+    s->siz *= 2;
+    s->bytes *= 2;
+    if (s->data == s->def) {
+        s->data = erts_alloc(ERTS_ALC_T_DB_MC_STK, s->bytes);
+        sys_memcpy(s->data, s->def, was_bytes);
+    }
+    else {
+        s->data = erts_realloc(ERTS_ALC_T_DB_MC_STK, s->data, s->bytes);
+    }
+}
     
-#define DMC_INIT_STACK(Name) \
-     (Name).pos = 0; (Name).siz = DMC_DEFAULT_SIZE; (Name).data = (Name).def
+#define DMC_INIT_STACK(Name) do {       \
+    (Name).pos = 0;                     \
+    (Name).siz = DMC_DEFAULT_SIZE;      \
+    (Name).bytes = sizeof((Name).def);  \
+    (Name).data = (Name).def;           \
+} while (0)
 
 #define DMC_STACK_DATA(Name) (Name).data
 
@@ -87,19 +111,17 @@ typedef struct DMC_STACK_TYPE(Type) {		\
 
 #define DMC_PUSH(On, What)						\
 do {									\
-    if ((On).pos >= (On).siz) {						\
-	(On).siz *= 2;							\
-	(On).data							\
-	    = (((On).def == (On).data)					\
-	       ? memcpy(erts_alloc(ERTS_ALC_T_DB_MC_STK,		\
-				   (On).siz*sizeof(*((On).data))),	\
-			(On).def,					\
-			DMC_DEFAULT_SIZE*sizeof(*((On).data)))		\
-	       : erts_realloc(ERTS_ALC_T_DB_MC_STK,			\
-			      (void *) (On).data,			\
-			      (On).siz*sizeof(*((On).data))));		\
-    }									\
+    if ((On).pos >= (On).siz)  						\
+        dmc_stack_grow((DMC_Dummy_stack*)&(On));                        \
     (On).data[(On).pos++] = What;					\
+} while (0)
+
+#define DMC_PUSH2(On, A, B)						\
+do {									\
+    if ((On).pos+1 >= (On).siz)  					\
+        dmc_stack_grow((DMC_Dummy_stack*)&(On));                        \
+    (On).data[(On).pos++] = A;					        \
+    (On).data[(On).pos++] = B;					        \
 } while (0)
 
 #define DMC_POP(From) (From).data[--(From).pos]
@@ -155,6 +177,7 @@ set_tracee_flags(Process *tracee_p, ErtsTracer tracer,
 	   : am_false);
     erts_tracer_replace(&tracee_p->common, tracer);
     ERTS_TRACE_FLAGS(tracee_p) = flags;
+
     return ret;
 }
 /*
@@ -1518,7 +1541,7 @@ restart:
 	 context.current_match < num_progs; 
 	 ++context.current_match) { /* This loop is long, 
 				       too long */
-	memset(heap.vars, 0, heap.size * sizeof(*heap.vars));
+	sys_memset(heap.vars, 0, heap.size * sizeof(*heap.vars));
 	t = context.matchexpr[context.current_match];
 	context.stack_used = 0;
 	structure_checked = 0;
@@ -1537,8 +1560,7 @@ restart:
                 if (is_flatmap(t)) {
                     num_iters = flatmap_get_size(flatmap_val(t));
                     if (!structure_checked) {
-                        DMC_PUSH(text, matchMap);
-                        DMC_PUSH(text, num_iters);
+                        DMC_PUSH2(text, matchMap, num_iters);
                     }
                     structure_checked = 0;
                     for (i = 0; i < num_iters; ++i) {
@@ -1558,8 +1580,7 @@ restart:
                             }
                             goto error;
                         }
-                        DMC_PUSH(text, matchKey);
-                        DMC_PUSH(text, dmc_private_copy(&context, key));
+                        DMC_PUSH2(text, matchKey, dmc_private_copy(&context, key));
                         {
                             int old_stack = ++(context.stack_used);
                             Eterm value = flatmap_get_values(flatmap_val(t))[i];
@@ -1587,8 +1608,7 @@ restart:
                     Eterm *kv;
                     num_iters = hashmap_size(t);
                     if (!structure_checked) {
-                        DMC_PUSH(text, matchMap);
-                        DMC_PUSH(text, num_iters);
+                        DMC_PUSH2(text, matchMap, num_iters);
                     }
                     structure_checked = 0;
 
@@ -1614,8 +1634,7 @@ restart:
                             DESTROY_WSTACK(wstack);
                             goto error;
                         }
-                        DMC_PUSH(text, matchKey);
-                        DMC_PUSH(text, dmc_private_copy(&context, key));
+                        DMC_PUSH2(text, matchKey, dmc_private_copy(&context, key));
                         {
                             int old_stack = ++(context.stack_used);
                             res = dmc_one_term(&context, &heap, &stack, &text,
@@ -1645,8 +1664,7 @@ restart:
 		num_iters = arityval(*tuple_val(t));
 		if (!structure_checked) { /* i.e. we did not 
 					     pop it */
-		    DMC_PUSH(text,matchTuple);
-		    DMC_PUSH(text,num_iters);
+		    DMC_PUSH2(text, matchTuple, num_iters);
 		}
 		structure_checked = 0;
 		for (i = 1; i <= num_iters; ++i) {
@@ -2140,7 +2158,7 @@ restart:
 	case matchEqFloat:
 	    if (!is_float(*ep))
 		FAIL();
-	    if (memcmp(float_val(*ep) + 1, pc, sizeof(double)))
+	    if (sys_memcmp(float_val(*ep) + 1, pc, sizeof(double)))
 		FAIL();
 	    pc += TermWords(2);
 	    ++ep;
@@ -2742,8 +2760,8 @@ Eterm db_format_dmc_err_info(Process *p, DMCErrInfo *ei)
 	if (vnum >= 0)
 	    erts_snprintf(buff,sizeof(buff)+20,tmp->error_string, vnum);
 	else
-	    strcpy(buff,tmp->error_string);
-	sl = strlen(buff);
+	    sys_strcpy(buff,tmp->error_string);
+	sl = sys_strlen(buff);
 	shp = HAlloc(p, sl * 2 + 5);
 	sev = (tmp->severity == dmcWarning) ? 
 	    am_atom_put("warning",7) :
@@ -3535,20 +3553,17 @@ static DMCRet dmc_one_term(DMCContext *context,
 		return retRestart;
 	    }
 	    if (heap->vars[n].is_bound) {
-		DMC_PUSH(*text,matchCmp);
-		DMC_PUSH(*text,n);
+		DMC_PUSH2(*text, matchCmp, n);
 	    } else { /* Not bound, bind! */
 		if (n >= heap->vars_used)
 		    heap->vars_used = n + 1;
-		DMC_PUSH(*text,matchBind);
-		DMC_PUSH(*text,n);
+		DMC_PUSH2(*text, matchBind, n);
 		heap->vars[n].is_bound = 1;
 	    }
 	} else if (c == am_Underscore) {
 	    DMC_PUSH(*text, matchSkip);
 	} else { /* Any immediate value */
-	    DMC_PUSH(*text, matchEq);
-	    DMC_PUSH(*text, (Uint) c);
+	    DMC_PUSH2(*text, matchEq, (Uint) c);
 	}
 	break;
     case TAG_PRIMARY_LIST:
@@ -3561,9 +3576,8 @@ static DMCRet dmc_one_term(DMCContext *context,
 	switch ((hdr & _TAG_HEADER_MASK) >> _TAG_PRIMARY_SIZE) {
 	case (_TAG_HEADER_ARITYVAL >> _TAG_PRIMARY_SIZE):    
 	    n = arityval(*tuple_val(c));
-	    DMC_PUSH(*text, matchPushT);
+	    DMC_PUSH2(*text, matchPushT, n);
 	    ++(context->stack_used);
-	    DMC_PUSH(*text, n);
 	    DMC_PUSH(*stack, c);
 	    break;
         case (_TAG_HEADER_MAP >> _TAG_PRIMARY_SIZE):
@@ -3571,9 +3585,8 @@ static DMCRet dmc_one_term(DMCContext *context,
                 n = flatmap_get_size(flatmap_val(c));
             else
                 n = hashmap_size(c);
-            DMC_PUSH(*text, matchPushM);
+            DMC_PUSH2(*text, matchPushM, n);
             ++(context->stack_used);
-            DMC_PUSH(*text, n);
             DMC_PUSH(*stack, c);
             break;
 	case (_TAG_HEADER_REF >> _TAG_PRIMARY_SIZE):
@@ -3598,8 +3611,7 @@ static DMCRet dmc_one_term(DMCContext *context,
 	    break;
 	}
 	case (_TAG_HEADER_FLOAT >> _TAG_PRIMARY_SIZE):
-	    DMC_PUSH(*text,matchEqFloat);
-	    DMC_PUSH(*text, (Uint) float_val(c)[1]);
+	    DMC_PUSH2(*text, matchEqFloat, (Uint) float_val(c)[1]);
 #ifdef ARCH_64
 	    DMC_PUSH(*text, (Uint) 0);
 #else
@@ -3607,8 +3619,7 @@ static DMCRet dmc_one_term(DMCContext *context,
 #endif
 	    break;
 	default: /* BINARY, FUN, VECTOR, or EXTERNAL */
-	    DMC_PUSH(*text, matchEqBin);
-            DMC_PUSH(*text, dmc_private_copy(context, c));
+	    DMC_PUSH2(*text, matchEqBin, dmc_private_copy(context, c));
 	    break;
 	}
 	break;
@@ -3658,8 +3669,7 @@ static void do_emit_constant(DMCContext *context, DMC_STACK_TYPE(UWord) *text,
 	    emb->next = context->save;
 	    context->save = emb;
 	}
-	DMC_PUSH(*text,matchPushC);
-	DMC_PUSH(*text,(Uint) tmp);
+	DMC_PUSH2(*text, matchPushC, (Uint)tmp);
 	if (++context->stack_used > context->stack_need)
 	    context->stack_need = context->stack_used;
 }
@@ -3797,8 +3807,7 @@ dmc_tuple(DMCContext *context, DMCHeap *heap, DMC_STACK_TYPE(UWord) *text,
         *constant = 1;
         return retOk;
     }
-    DMC_PUSH(*text, matchMkTuple);
-    DMC_PUSH(*text, nelems);
+    DMC_PUSH2(*text, matchMkTuple, nelems);
     context->stack_used -= (nelems - 1);
     *constant = 0;
     return retOk;
@@ -3825,13 +3834,11 @@ dmc_map(DMCContext *context, DMCHeap *heap, DMC_STACK_TYPE(UWord) *text,
             *constant = 1;
             return retOk;
         }
-        DMC_PUSH(*text, matchPushC);
-        DMC_PUSH(*text, dmc_private_copy(context, m->keys));
+        DMC_PUSH2(*text, matchPushC, dmc_private_copy(context, m->keys));
         if (++context->stack_used > context->stack_need) {
             context->stack_need = context->stack_used;
         }
-        DMC_PUSH(*text, matchMkFlatMap);
-        DMC_PUSH(*text, nelems);
+        DMC_PUSH2(*text, matchMkFlatMap, nelems);
         context->stack_used -= nelems;
         *constant = 0;
         return retOk;
@@ -3883,8 +3890,7 @@ dmc_map(DMCContext *context, DMCHeap *heap, DMC_STACK_TYPE(UWord) *text,
                 do_emit_constant(context, text, CDR(kv));
             }
         }
-        DMC_PUSH(*text, matchMkHashMap);
-        DMC_PUSH(*text, nelems);
+        DMC_PUSH2(*text, matchMkHashMap, nelems);
         context->stack_used -= nelems;
         DESTROY_WSTACK(wstack);
         return retOk;
@@ -5044,7 +5050,7 @@ static int match_compact(ErlHeapFragment *expr, DMCErrInfo *err_info)
 	    ASSERT(j < x);
 	    erts_snprintf(buff+1, sizeof(buff) - 1, "%u", (unsigned) j);
 	    /* Yes, writing directly into terms, they ARE off heap */
-	    *p = erts_atom_put((byte *) buff, strlen(buff),
+	    *p = erts_atom_put((byte *) buff, sys_strlen(buff),
 			       ERTS_ATOM_ENC_LATIN1, 1);
 	}
 	++p;
@@ -5505,7 +5511,7 @@ void db_match_dis(Binary *bp)
 	    ++t;
 	    {
 		double num;
-		memcpy(&num,t,sizeof(double));
+		sys_memcpy(&num,t,sizeof(double));
 		t += TermWords(2);
 		erts_printf("EqFloat\t%f\n", num);
 	    }

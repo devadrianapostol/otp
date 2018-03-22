@@ -266,10 +266,9 @@ send_handshake(Handshake, State) ->
 queue_handshake(Handshake, #state{negotiated_version = Version,
 				  tls_handshake_history = Hist0,
 				  flight_buffer = Flight0,
-				  ssl_options = #ssl_options{v2_hello_compatible = V2HComp},				  
 				  connection_states = ConnectionStates0} = State0) ->
     {BinHandshake, ConnectionStates, Hist} =
-	encode_handshake(Handshake, Version, ConnectionStates0, Hist0, V2HComp),
+	encode_handshake(Handshake, Version, ConnectionStates0, Hist0),
     State0#state{connection_states = ConnectionStates,
 		 tls_handshake_history = Hist,
 		 flight_buffer = Flight0 ++ [BinHandshake]}.
@@ -400,7 +399,7 @@ getopts(Transport, Socket, Tag) ->
 
 init({call, From}, {start, Timeout}, 
      #state{host = Host, port = Port, role = client,
-	    ssl_options = #ssl_options{v2_hello_compatible = V2HComp} = SslOpts,
+	    ssl_options = SslOpts,
 	    session = #session{own_certificate = Cert} = Session0,
 	    transport_cb = Transport, socket = Socket,
 	    connection_states = ConnectionStates0,
@@ -416,7 +415,7 @@ init({call, From}, {start, Timeout},
     HelloVersion = tls_record:hello_version(Version, SslOpts#ssl_options.versions),
     Handshake0 = ssl_handshake:init_handshake_history(),
     {BinMsg, ConnectionStates, Handshake} =
-        encode_handshake(Hello,  HelloVersion, ConnectionStates0, Handshake0, V2HComp),
+        encode_handshake(Hello,  HelloVersion, ConnectionStates0, Handshake0),
     send(Transport, Socket, BinMsg),
     State1 = State0#state{connection_states = ConnectionStates,
 			  negotiated_version = Version, %% Requested version
@@ -640,17 +639,29 @@ initial_state(Role, Host, Port, Socket, {SSLOptions, SocketOptions, Tracker}, Us
 	   flight_buffer = []
 	  }.
 
-next_tls_record(Data, #state{protocol_buffers = #protocol_buffers{tls_record_buffer = Buf0,
-						tls_cipher_texts = CT0} = Buffers} = State0) ->
-    case tls_record:get_tls_records(Data, Buf0) of
+next_tls_record(Data, StateName, #state{protocol_buffers = 
+                                            #protocol_buffers{tls_record_buffer = Buf0,
+                                                              tls_cipher_texts = CT0} = Buffers}
+                                        = State0) ->
+    case tls_record:get_tls_records(Data, 
+                                    acceptable_record_versions(StateName, State0),
+                                    Buf0) of
 	{Records, Buf1} ->
 	    CT1 = CT0 ++ Records,
 	    next_record(State0#state{protocol_buffers =
 					 Buffers#protocol_buffers{tls_record_buffer = Buf1,
 								  tls_cipher_texts = CT1}});
 	#alert{} = Alert ->
-	    Alert
+	    handle_record_alert(Alert, State0)
     end.
+
+
+acceptable_record_versions(hello, _) ->
+    [tls_record:protocol_version(Vsn) || Vsn <- ?ALL_AVAILABLE_VERSIONS];
+acceptable_record_versions(_, #state{negotiated_version = Version}) ->
+    [Version].
+handle_record_alert(Alert, _) ->
+    Alert.
 
 tls_handshake_events(Packets) ->
     lists:map(fun(Packet) ->
@@ -660,7 +671,7 @@ tls_handshake_events(Packets) ->
 %% raw data from socket, upack records
 handle_info({Protocol, _, Data}, StateName,
             #state{data_tag = Protocol} = State0) ->
-    case next_tls_record(Data, State0) of
+    case next_tls_record(Data, StateName, State0) of
 	{Record, State} ->
 	    next_event(StateName, Record, State);
 	#alert{} = Alert ->
@@ -711,9 +722,9 @@ handle_alerts([Alert | Alerts], {next_state, StateName, State}) ->
 handle_alerts([Alert | Alerts], {next_state, StateName, State, _Actions}) ->
      handle_alerts(Alerts, ssl_connection:handle_alert(Alert, StateName, State)).
 
-encode_handshake(Handshake, Version, ConnectionStates0, Hist0, V2HComp) ->
+encode_handshake(Handshake, Version, ConnectionStates0, Hist0) ->
     Frag = tls_handshake:encode_handshake(Handshake, Version),
-    Hist = ssl_handshake:update_handshake_history(Hist0, Frag, V2HComp),
+    Hist = ssl_handshake:update_handshake_history(Hist0, Frag),
     {Encoded, ConnectionStates} =
         tls_record:encode_handshake(Frag, Version, ConnectionStates0),
     {Encoded, ConnectionStates, Hist}.

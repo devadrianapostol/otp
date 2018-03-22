@@ -35,6 +35,8 @@
 
 -define(DEFAULT_TRANSPORT,  {tcp, gen_tcp, tcp_closed} ).
 
+-define(DEFAULT_SHELL, {shell, start, []} ).
+
 -define(MAX_RND_PADDING_LEN, 15).
 
 -define(SUPPORTED_AUTH_METHODS, "publickey,keyboard-interactive,password").
@@ -112,7 +114,7 @@
                              | {mac, double_algs()}
                              | {compression, double_algs()} .
 -type simple_algs()         :: list( atom() ) .
--type double_algs()         :: list( {client2serverlist,simple_algs()} | {server2client,simple_algs()} )
+-type double_algs()         :: list( {client2server,simple_algs()} | {server2client,simple_algs()} )
                              | simple_algs() .
 
 -type options() :: #{socket_options   := socket_options(),

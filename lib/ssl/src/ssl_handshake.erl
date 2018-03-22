@@ -52,7 +52,7 @@
 %% Handle handshake messages
 -export([certify/7, certificate_verify/6, verify_signature/5,
 	 master_secret/4, server_key_exchange_hash/2, verify_connection/6,
-	 init_handshake_history/0, update_handshake_history/3, verify_server_key/5,
+	 init_handshake_history/0, update_handshake_history/2, verify_server_key/5,
          select_version/3
 	]).
 
@@ -189,12 +189,18 @@ certificate_request(CipherSuite, CertDbHandle, CertDbRef, HashSigns, Version) ->
 		   {dh, binary()} |
 		   {dh, {binary(), binary()}, #'DHParameter'{}, {HashAlgo::atom(), SignAlgo::atom()},
 		   binary(), binary(), public_key:private_key()} |
+		   {ecdh, _, _, _, _, _} |
 		   {ecdh, #'ECPrivateKey'{}} |
+		   {psk, _, _, _, _, _} |
 		   {psk, binary()} |
+		   {dhe_psk, _, _, _, _, _, _, _} |
 		   {dhe_psk, binary(), binary()} |
+		   {ecdhe_psk, _, _, _, _, _, _} |
 		   {ecdhe_psk, binary(), #'ECPrivateKey'{}} |
 		   {srp, {binary(), binary()}, #srp_user{}, {HashAlgo::atom(), SignAlgo::atom()},
-		   binary(), binary(), public_key:private_key()}) ->
+                    binary(), binary(), public_key:private_key()} |
+		   {srp, _} |
+                   {psk_premaster_secret, _, _, _}) ->
     #client_key_exchange{} | #server_key_exchange{}.
 
 %%
@@ -473,24 +479,12 @@ init_handshake_history() ->
     {[], []}.
 
 %%--------------------------------------------------------------------
--spec update_handshake_history(ssl_handshake:ssl_handshake_history(), Data ::term(), boolean()) ->
+-spec update_handshake_history(ssl_handshake:ssl_handshake_history(), Data ::term()) ->
 				      ssl_handshake:ssl_handshake_history().
 %%
 %% Description: Update the handshake history buffer with Data.
 %%--------------------------------------------------------------------
-update_handshake_history(Handshake, % special-case SSL2 client hello
-			 <<?CLIENT_HELLO, ?UINT24(_), ?BYTE(Major), ?BYTE(Minor),
-			   ?UINT16(CSLength), ?UINT16(0),
-			   ?UINT16(CDLength),
-			   CipherSuites:CSLength/binary,
-			   ChallengeData:CDLength/binary>>, true) ->
-    update_handshake_history(Handshake,
-			     <<?CLIENT_HELLO, ?BYTE(Major), ?BYTE(Minor),
-			       ?UINT16(CSLength), ?UINT16(0),
-			       ?UINT16(CDLength),
-			       CipherSuites:CSLength/binary,
-			       ChallengeData:CDLength/binary>>, true);
-update_handshake_history({Handshake0, _Prev}, Data, _) ->
+update_handshake_history({Handshake0, _Prev}, Data) ->
     {[Data|Handshake0], Handshake0}.
 
 verify_server_key(#server_key_params{params_bin = EncParams,
@@ -774,9 +768,8 @@ decode_suites('3_bytes', Dec) ->
 %%====================================================================
 
 available_suites(UserSuites, Version) ->
-    lists:filtermap(fun(Suite) ->
-			    lists:member(Suite, ssl_cipher:all_suites(Version))
-		    end, UserSuites).
+    VersionSuites = ssl_cipher:all_suites(Version) ++ ssl_cipher:anonymous_suites(Version),
+    lists:filtermap(fun(Suite) -> lists:member(Suite, VersionSuites) end, UserSuites).
 
 available_suites(ServerCert, UserSuites, Version, undefined, Curve) ->
     ssl_cipher:filter(ServerCert, available_suites(UserSuites, Version))
@@ -1056,7 +1049,9 @@ select_curve(undefined, _, _) ->
 %%
 %% Description: Handles signature_algorithms hello extension (server)
 %%--------------------------------------------------------------------
-select_hashsign(_, undefined, _,  _, _Version) ->
+select_hashsign(_, _, KeyExAlgo, _, _Version) when KeyExAlgo == dh_anon;
+                                                   KeyExAlgo == ecdh_anon;
+                                                   KeyExAlgo == srp_anon ->
     {null, anon};
 %% The signature_algorithms extension was introduced with TLS 1.2. Ignore it if we have
 %% negotiated a lower version.

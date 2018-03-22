@@ -636,6 +636,8 @@ typedef struct preload {
  */
 typedef Eterm ErtsTracer;
 
+#include "erl_osenv.h"
+
 /*
  * This structure contains options to all built in drivers.
  * None of the drivers use all of the fields.
@@ -651,8 +653,7 @@ typedef struct _SysDriverOpts {
     int hide_window;		/* Hide this windows (Windows). */
     int exit_status;		/* Report exit status of subprocess. */
     int overlapped_io;          /* Only has effect on windows NT et al */
-    char *envir;		/* Environment of the port process, */
-				/* in Windows format. */
+    erts_osenv_t envir;		/* Environment of the port process */
     char **argv;                /* Argument vector in Unix'ish format. */
     char *wd;			/* Working directory. */
     unsigned spawn_type;        /* Bitfield of ERTS_SPAWN_DRIVER | 
@@ -782,9 +783,6 @@ void set_break_quit(void (*)(void), void (*)(void));
 
 void os_flavor(char*, unsigned);
 void os_version(int*, int*, int*);
-void init_getenv_state(GETENV_STATE *);
-char * getenv_string(GETENV_STATE *);
-void fini_getenv_state(GETENV_STATE *);
 
 #define HAVE_ERTS_CHECK_IO_DEBUG
 typedef struct {
@@ -805,20 +803,21 @@ int sys_double_to_chars_ext(double, char*, size_t, size_t);
 int sys_double_to_chars_fast(double, char*, int, int, int);
 void sys_get_pid(char *, size_t);
 
-/* erts_sys_putenv() returns, 0 on success and a value != 0 on failure. */
-int erts_sys_putenv(char *key, char *value);
-/* Simple variant used from drivers, raw eightbit interface */
-int erts_sys_putenv_raw(char *key, char *value);
-/* erts_sys_getenv() returns 0 on success (length of value string in
-   *size), a value > 0 if value buffer is too small (*size is set to needed
-   size), and a value < 0 on failure. */
-int erts_sys_getenv(char *key, char *value, size_t *size);
-/* Simple variant used from drivers, raw eightbit interface */
-int erts_sys_getenv_raw(char *key, char *value, size_t *size);
-/* erts_sys_getenv__() is only allowed to be used in early init phase */
-int erts_sys_getenv__(char *key, char *value, size_t *size);
-/* erst_sys_unsetenv() returns 0 on success and a value != 0 on failure. */
-int erts_sys_unsetenv(char *key);
+/* erl_drv_get/putenv have been implicitly 8-bit for so long that we can't
+ * change them without breaking things on Windows. Their return values are
+ * identical to erts_osenv_get/putenv */
+int erts_sys_explicit_8bit_getenv(char *key, char *value, size_t *size);
+int erts_sys_explicit_8bit_putenv(char *key, char *value);
+
+/* This is identical to erts_sys_explicit_8bit_getenv but falls down to the
+ * host OS implementation instead of erts_osenv. */
+int erts_sys_explicit_host_getenv(char *key, char *value, size_t *size);
+
+const erts_osenv_t *erts_sys_rlock_global_osenv(void);
+void erts_sys_runlock_global_osenv(void);
+
+erts_osenv_t *erts_sys_rwlock_global_osenv(void);
+void erts_sys_rwunlock_global_osenv(void);
 
 /* Easier to use, but not as efficient, environment functions */
 char *erts_read_env(char *key);
@@ -995,18 +994,82 @@ erts_refc_read(erts_refc_t *refcp, erts_aint_t min_val)
     return val;
 }
 
-#endif /* #if ERTS_GLB_INLINE_INCL_FUNC_DEF */
+#endif  /* #if ERTS_GLB_INLINE_INCL_FUNC_DEF */
 
-#define sys_memcpy(s1,s2,n)  memcpy(s1,s2,n)
-#define sys_memmove(s1,s2,n) memmove(s1,s2,n)
-#define sys_memcmp(s1,s2,n)  memcmp(s1,s2,n)
-#define sys_memset(s,c,n)    memset(s,c,n)
-#define sys_memzero(s, n)    memset(s,'\0',n)
-#define sys_strcmp(s1,s2)    strcmp(s1,s2)
-#define sys_strncmp(s1,s2,n) strncmp(s1,s2,n)
-#define sys_strcpy(s1,s2)    strcpy(s1,s2)
-#define sys_strncpy(s1,s2,n) strncpy(s1,s2,n)
-#define sys_strlen(s)        strlen(s)
+
+/* Thin wrappers around memcpy and friends, which should always be used in
+ * place of plain memcpy, memset, etc.
+ *
+ * Passing NULL to any of these functions is undefined behavior even though it
+ * may seemingly work when the length (if any) is zero; a compiler can take
+ * this as a hint that the passed operand may *never* be NULL and then optimize
+ * based on that information.
+ */
+ERTS_GLB_INLINE void *sys_memcpy(void *dest, const void *src, size_t n);
+ERTS_GLB_INLINE void *sys_memmove(void *dest, const void *src, size_t n);
+ERTS_GLB_INLINE int sys_memcmp(const void *s1, const void *s2, size_t n);
+ERTS_GLB_INLINE void *sys_memset(void *s, int c, size_t n);
+ERTS_GLB_INLINE void *sys_memzero(void *s, size_t n);
+ERTS_GLB_INLINE int sys_strcmp(const char *s1, const char *s2);
+ERTS_GLB_INLINE int sys_strncmp(const char *s1, const char *s2, size_t n);
+ERTS_GLB_INLINE char *sys_strcpy(char *dest, const char *src);
+ERTS_GLB_INLINE char *sys_strncpy(char *dest, const char *src, size_t n);
+ERTS_GLB_INLINE size_t sys_strlen(const char *s);
+
+#if ERTS_GLB_INLINE_INCL_FUNC_DEF
+
+ERTS_GLB_INLINE void *sys_memcpy(void *dest, const void *src, size_t n)
+{
+    ASSERT(dest != NULL && src != NULL);
+    return memcpy(dest,src,n);
+}
+ERTS_GLB_INLINE void *sys_memmove(void *dest, const void *src, size_t n)
+{
+    ASSERT(dest != NULL && src != NULL);
+    return memmove(dest,src,n);
+}
+ERTS_GLB_INLINE int sys_memcmp(const void *s1, const void *s2, size_t n)
+{
+    ASSERT(s1 != NULL && s2 != NULL);
+    return memcmp(s1,s2,n);
+}
+ERTS_GLB_INLINE void *sys_memset(void *s, int c, size_t n)
+{
+    ASSERT(s != NULL);
+    return memset(s,c,n);
+}
+ERTS_GLB_INLINE void *sys_memzero(void *s, size_t n)
+{
+    ASSERT(s != NULL);
+    return memset(s,'\0',n);
+}
+ERTS_GLB_INLINE int sys_strcmp(const char *s1, const char *s2)
+{
+    ASSERT(s1 != NULL && s2 != NULL);
+    return strcmp(s1,s2);
+}
+ERTS_GLB_INLINE int sys_strncmp(const char *s1, const char *s2, size_t n)
+{
+    ASSERT(s1 != NULL && s2 != NULL);
+    return strncmp(s1,s2,n);
+}
+ERTS_GLB_INLINE char *sys_strcpy(char *dest, const char *src)
+{
+    ASSERT(dest != NULL && src != NULL);
+    return strcpy(dest,src);
+
+}
+ERTS_GLB_INLINE char *sys_strncpy(char *dest, const char *src, size_t n)
+{
+    ASSERT(dest != NULL && src != NULL);
+    return strncpy(dest,src,n);
+}
+ERTS_GLB_INLINE size_t sys_strlen(const char *s)
+{
+    ASSERT(s != NULL);
+    return strlen(s);
+}
+#endif /* #if ERTS_GLB_INLINE_INCL_FUNC_DEF */
 
 /* define function symbols (needed in sys_drv_api) */
 #define sys_fp_alloc     sys_alloc

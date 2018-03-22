@@ -496,8 +496,10 @@ Process *hipe_mode_switch(Process *p, unsigned cmd, Eterm reg[])
 	      erts_proc_lock(p, ERTS_PROC_LOCKS_MSG_RECEIVE);
 	  p->i = hipe_beam_pc_resume;
 	  p->arity = 0;
-	  erts_atomic32_read_band_relb(&p->state,
-					   ~ERTS_PSFLG_ACTIVE);
+          if (erts_atomic32_read_nob(&p->state) & ERTS_PSFLG_EXITING)
+              ASSERT(erts_atomic32_read_nob(&p->state) & ERTS_PSFLG_ACTIVE);
+          else
+              erts_atomic32_read_band_relb(&p->state, ~ERTS_PSFLG_ACTIVE);
 	  erts_proc_unlock(p, ERTS_PROC_LOCKS_MSG_RECEIVE);
       do_schedule:
 	  {
@@ -662,7 +664,8 @@ void hipe_inc_nstack(Process *p)
     Eterm *new_nstack = erts_alloc(ERTS_ALC_T_HIPE_STK, new_size*sizeof(Eterm));
     unsigned used_size = p->hipe.nstend - p->hipe.nsp;
 
-    sys_memcpy(new_nstack+new_size-used_size, p->hipe.nsp, used_size*sizeof(Eterm));
+    if (used_size)
+        sys_memcpy(new_nstack+new_size-used_size, p->hipe.nsp, used_size*sizeof(Eterm));
     if (p->hipe.nstgraylim)
 	p->hipe.nstgraylim = new_nstack + new_size - (p->hipe.nstend - p->hipe.nstgraylim);
     if (p->hipe.nstblacklim)

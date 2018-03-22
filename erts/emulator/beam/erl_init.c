@@ -1,7 +1,7 @@
 /*
  * %CopyrightBegin%
  *
- * Copyright Ericsson AB 1997-2017. All Rights Reserved.
+ * Copyright Ericsson AB 1997-2018. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -50,6 +50,8 @@
 #define ERTS_WANT_TIMER_WHEEL_API
 #include "erl_time.h"
 #include "erl_check_io.h"
+#include "erl_osenv.h"
+#include "erl_proc_sig_queue.h"
 
 #ifdef HIPE
 #include "hipe_mode_switch.h"	/* for hipe_mode_switch_init() */
@@ -126,6 +128,8 @@ const Eterm etp_hole_marker = 0;
 
 static int modified_sched_thread_suggested_stack_size = 0;
 
+Eterm erts_init_process_id;
+
 /*
  * Note about VxWorks: All variables must be initialized by executable code,
  * not by an initializer. Otherwise a new instance of the emulator will
@@ -154,9 +158,6 @@ static erts_atomic_t exiting;
 erts_atomic32_t erts_writing_erl_crash_dump;
 erts_tsd_key_t erts_is_crash_dumping_key;
 int erts_initialized = 0;
-
-
-int erts_use_sender_punish;
 
 /*
  * Configurable parameters.
@@ -241,7 +242,7 @@ progname(char *fullname)
 {
     int i;
     
-    i = strlen(fullname);
+    i = sys_strlen(fullname);
     while (i >= 0) {
 	if ((fullname[i] != '/') && (fullname[i] != '\\')) 
 	    i--;
@@ -307,8 +308,9 @@ erl_init(int ncpu,
 	 int node_tab_delete_delay,
 	 ErtsDbSpinCount db_spin_count)
 {
+    erts_monitor_link_init();
+    erts_proc_sig_queue_init();
     erts_bif_unique_init();
-    erts_init_monitors();
     erts_init_time(time_correction, time_warp_mode);
     erts_init_sys_common_misc();
     erts_init_process(ncpu, proc_tab_sz, legacy_proc_tab);
@@ -416,7 +418,7 @@ erl_first_process_otp(char* modname, void* code, unsigned size, int argc, char**
 }
 
 static Eterm
-erl_system_process_otp(Eterm parent_pid, char* modname, int off_heap_msgq)
+erl_system_process_otp(Eterm parent_pid, char* modname, int off_heap_msgq, int prio)
 {
     Eterm start_mod;
     Process* parent;
@@ -431,9 +433,16 @@ erl_system_process_otp(Eterm parent_pid, char* modname, int off_heap_msgq)
 
     parent = erts_pid2proc(NULL, 0, parent_pid, ERTS_PROC_LOCK_MAIN);
 
-    so.flags = erts_default_spo_flags|SPO_SYSTEM_PROC;
+    so.flags = erts_default_spo_flags|SPO_SYSTEM_PROC|SPO_USE_ARGS;
     if (off_heap_msgq)
         so.flags |= SPO_OFF_HEAP_MSGQ;
+    so.min_heap_size    = H_MIN_SIZE;
+    so.min_vheap_size   = BIN_VH_MIN_SIZE;
+    so.max_heap_size    = H_MAX_SIZE;
+    so.max_heap_flags   = H_MAX_FLAGS;
+    so.priority         = prio;
+    so.max_gen_gcs      = (Uint16) erts_atomic32_read_nob(&erts_max_gen_gcs);
+    so.scheduler        = 0;
     res = erl_create_process(parent, start_mod, am_start, NIL, &so);
     erts_proc_unlock(parent, ERTS_PROC_LOCK_MAIN);
     return res;
@@ -758,8 +767,6 @@ early_init(int *argc, char **argv) /*
 
     erts_initialized = 0;
 
-    erts_use_sender_punish = 1;
-
     erts_pre_early_init_cpu_topology(&max_reader_groups,
 				     &ncpu,
 				     &ncpuonln,
@@ -803,8 +810,9 @@ early_init(int *argc, char **argv) /*
 
     envbufsz = sizeof(envbuf);
 
-    /* erts_sys_getenv(_raw)() not initialized yet; need erts_sys_getenv__() */
-    if (erts_sys_getenv__("ERL_THREAD_POOL_SIZE", envbuf, &envbufsz) == 0)
+    /* erts_osenv hasn't been initialized yet, so we need to fall back to
+     * erts_sys_explicit_host_getenv() */
+    if (erts_sys_explicit_host_getenv("ERL_THREAD_POOL_SIZE", envbuf, &envbufsz) == 1)
 	erts_async_max_threads = atoi(envbuf);
     else
 	erts_async_max_threads = ERTS_DEFAULT_NO_ASYNC_THREADS;
@@ -814,7 +822,7 @@ early_init(int *argc, char **argv) /*
     if (argc && argv) {
 	int i = 1;
 	while (i < *argc) {
-	    if (strcmp(argv[i], "--") == 0) { /* end of emulator options */
+	    if (sys_strcmp(argv[i], "--") == 0) { /* end of emulator options */
 		i++;
 		break;
 	    }
@@ -896,7 +904,7 @@ early_init(int *argc, char **argv) /*
 		    else if (argv[i][2] == 'D') {
 			char *arg;
 			char *type = argv[i]+3;
-			if (strncmp(type, "Pcpu", 4) == 0) {
+			if (sys_strncmp(type, "Pcpu", 4) == 0) {
 			    int ptot, ponln;
 			    arg = get_arg(argv[i]+7, argv[i+1], &i);
 			    switch (sscanf(arg, "%d:%d", &ptot, &ponln)) {
@@ -933,7 +941,7 @@ early_init(int *argc, char **argv) /*
 			    VERBOSE(DEBUG_SYSTEM,
 				    ("using %d:%d dirty CPU scheduler percentages\n",
 				     dirty_cpu_scheds_pctg, dirty_cpu_scheds_onln_pctg));
-			} else if (strncmp(type, "cpu", 3) == 0) {
+			} else if (sys_strncmp(type, "cpu", 3) == 0) {
 			    int tot, onln;
 			    arg = get_arg(argv[i]+6, argv[i+1], &i);
 			    switch (sscanf(arg, "%d:%d", &tot, &onln)) {
@@ -984,7 +992,7 @@ early_init(int *argc, char **argv) /*
 			    }
 			    VERBOSE(DEBUG_SYSTEM,
 				    ("using %d:%d dirty CPU scheduler(s)\n", tot, onln));
-			} else if (strncmp(type, "io", 2) == 0) {
+			} else if (sys_strncmp(type, "io", 2) == 0) {
 			    arg = get_arg(argv[i]+5, argv[i+1], &i);
 			    dirty_io_scheds = atoi(arg);
 			    if (dirty_io_scheds < 0 ||
@@ -1204,26 +1212,25 @@ erl_start(int argc, char **argv)
     ErtsTimeWarpMode time_warp_mode;
     int node_tab_delete_delay = ERTS_NODE_TAB_DELAY_GC_DEFAULT;
     ErtsDbSpinCount db_spin_count = ERTS_DB_SPNCNT_NORMAL;
-    Eterm otp_ring0_pid;
 
     set_default_time_adj(&time_correction,
 			 &time_warp_mode);
 
     envbufsz = sizeof(envbuf);
-    if (erts_sys_getenv_raw(ERL_MAX_ETS_TABLES_ENV, envbuf, &envbufsz) == 0)
+    if (erts_sys_explicit_8bit_getenv(ERL_MAX_ETS_TABLES_ENV, envbuf, &envbufsz) == 1)
 	user_requested_db_max_tabs = atoi(envbuf);
     else
 	user_requested_db_max_tabs = 0;
 
     envbufsz = sizeof(envbuf);
-    if (erts_sys_getenv_raw("ERL_FULLSWEEP_AFTER", envbuf, &envbufsz) == 0) {
+    if (erts_sys_explicit_8bit_getenv("ERL_FULLSWEEP_AFTER", envbuf, &envbufsz) == 1) {
 	Uint16 max_gen_gcs = atoi(envbuf);
 	erts_atomic32_set_nob(&erts_max_gen_gcs,
 				  (erts_aint32_t) max_gen_gcs);
     }
 
     envbufsz = sizeof(envbuf);
-    if (erts_sys_getenv_raw("ERL_MAX_PORTS", envbuf, &envbufsz) == 0) {
+    if (erts_sys_explicit_8bit_getenv("ERL_MAX_PORTS", envbuf, &envbufsz) == 1) {
 	port_tab_sz = atoi(envbuf);
 	port_tab_sz_ignore_files = 1;
     }
@@ -1246,7 +1253,7 @@ erl_start(int argc, char **argv)
 	if (argv[i][0] != '-') {
 	    erts_usage();
 	}
-	if (strcmp(argv[i], "--") == 0) { /* end of emulator options */
+	if (sys_strcmp(argv[i], "--") == 0) { /* end of emulator options */
 	    i++;
 	    break;
 	}
@@ -1274,12 +1281,12 @@ erl_start(int argc, char **argv)
                     ("using display items %d\n",display_items));
 	    break;
 	case 'p':
-	    if (!strncmp(argv[i],"-pc",3)) {
+	    if (!sys_strncmp(argv[i],"-pc",3)) {
 		int printable_chars = ERL_PRINTABLE_CHARACTERS_LATIN1;
 		arg = get_arg(argv[i]+3, argv[i+1], &i);
-		if (!strcmp(arg,"unicode")) {
+		if (!sys_strcmp(arg,"unicode")) {
 		    printable_chars = ERL_PRINTABLE_CHARACTERS_UNICODE;
-		} else if (strcmp(arg,"latin1")) {
+		} else if (sys_strcmp(arg,"latin1")) {
 		    erts_fprintf(stderr, "bad range of printable "
 				 "characters: %s\n", arg);
 		    erts_usage();
@@ -1291,7 +1298,7 @@ erl_start(int argc, char **argv)
 		erts_usage();
 	    }
 	case 'f':
-	    if (!strncmp(argv[i],"-fn",3)) {
+	    if (!sys_strncmp(argv[i],"-fn",3)) {
 		int warning_type =  ERL_FILENAME_WARNING_WARNING;
 		arg = get_arg(argv[i]+3, argv[i+1], &i);
 		switch (*arg) {
@@ -1474,9 +1481,9 @@ erl_start(int argc, char **argv)
 		}
             } else if (has_prefix("maxk", sub_param)) {
 		arg = get_arg(sub_param+4, argv[i+1], &i);
-		if (strcmp(arg,"true") == 0) {
+		if (sys_strcmp(arg,"true") == 0) {
                     H_MAX_FLAGS |= MAX_HEAP_SIZE_KILL;
-                } else if (strcmp(arg,"false") == 0) {
+                } else if (sys_strcmp(arg,"false") == 0) {
                     H_MAX_FLAGS &= ~MAX_HEAP_SIZE_KILL;
                 } else {
 		    erts_fprintf(stderr, "bad max heap kill %s\n", arg);
@@ -1485,9 +1492,9 @@ erl_start(int argc, char **argv)
 		VERBOSE(DEBUG_SYSTEM, ("using max heap kill %d\n", H_MAX_FLAGS));
             } else if (has_prefix("maxel", sub_param)) {
 		arg = get_arg(sub_param+5, argv[i+1], &i);
-		if (strcmp(arg,"true") == 0) {
+		if (sys_strcmp(arg,"true") == 0) {
                     H_MAX_FLAGS |= MAX_HEAP_SIZE_LOG;
-                } else if (strcmp(arg,"false") == 0) {
+                } else if (sys_strcmp(arg,"false") == 0) {
                     H_MAX_FLAGS &= ~MAX_HEAP_SIZE_LOG;
                 } else {
 		    erts_fprintf(stderr, "bad max heap error logger %s\n", arg);
@@ -1605,7 +1612,7 @@ erl_start(int argc, char **argv)
 
 	case 'P': /* set maximum number of processes */
 	    arg = get_arg(argv[i]+2, argv[i+1], &i);
-	    if (strcmp(arg, "legacy") == 0)
+	    if (sys_strcmp(arg, "legacy") == 0)
 		legacy_proc_tab = 1;
 	    else {
 		errno = 0;
@@ -1621,7 +1628,7 @@ erl_start(int argc, char **argv)
 
 	case 'Q': /* set maximum number of ports */
 	    arg = get_arg(argv[i]+2, argv[i+1], &i);
-	    if (strcmp(arg, "legacy") == 0)
+	    if (sys_strcmp(arg, "legacy") == 0)
 		legacy_port_tab = 1;
 	    else {
 		errno = 0;
@@ -1639,11 +1646,11 @@ erl_start(int argc, char **argv)
 	case 'S' : /* Was handled in early_init() just read past it */
 	    if (argv[i][2] == 'D') {
 		char* type = argv[i]+3;
-		if (strcmp(type, "Pcpu") == 0)
+		if (sys_strcmp(type, "Pcpu") == 0)
 		    (void) get_arg(argv[i]+7, argv[i+1], &i);
-		if (strcmp(type, "cpu") == 0)
+		if (sys_strcmp(type, "cpu") == 0)
 		    (void) get_arg(argv[i]+6, argv[i+1], &i);
-		else if (strcmp(type, "io") == 0)
+		else if (sys_strcmp(type, "io") == 0)
 		    (void) get_arg(argv[i]+5, argv[i+1], &i);
 	    } else if (argv[i][2] == 'P')
 		(void) get_arg(argv[i]+3, argv[i+1], &i);
@@ -1750,6 +1757,7 @@ erl_start(int argc, char **argv)
 	    }
             else if (has_prefix("ecio", sub_param)) {
                 /* ignore argument, eager check io no longer used */
+                arg = get_arg(sub_param+4, argv[i+1], &i);
             }
 	    else if (has_prefix("pp", sub_param)) {
 		arg = get_arg(sub_param+2, argv[i+1], &i);
@@ -1764,8 +1772,6 @@ erl_start(int argc, char **argv)
 		    erts_usage();
 		}
 	    }
-	    else if (sys_strcmp("nsp", sub_param) == 0)
-		erts_use_sender_punish = 0;
 	    else if (has_prefix("tbt", sub_param)) {
 		arg = get_arg(sub_param+3, argv[i+1], &i);
 		res = erts_init_scheduler_bind_type_string(arg);
@@ -2196,8 +2202,8 @@ erl_start(int argc, char **argv)
 
     erts_initialized = 1;
 
-    otp_ring0_pid = erl_first_process_otp("otp_ring0", NULL, 0,
-					  boot_argc, boot_argv);
+    erts_init_process_id = erl_first_process_otp("otp_ring0", NULL, 0,
+                                                 boot_argc, boot_argv);
 
     {
 	/*
@@ -2207,14 +2213,18 @@ erl_start(int argc, char **argv)
 	 */
 	Eterm pid;
 
-	pid = erl_system_process_otp(otp_ring0_pid, "erts_code_purger", !0);
+	pid = erl_system_process_otp(erts_init_process_id,
+                                     "erts_code_purger", !0,
+                                     PRIORITY_NORMAL);
 	erts_code_purger
 	    = (Process *) erts_ptab_pix2intptr_ddrb(&erts_proc,
 						    internal_pid_index(pid));
 	ASSERT(erts_code_purger && erts_code_purger->common.id == pid);
 	erts_proc_inc_refc(erts_code_purger); 
 
-	pid = erl_system_process_otp(otp_ring0_pid, "erts_literal_area_collector", !0);
+	pid = erl_system_process_otp(erts_init_process_id,
+                                     "erts_literal_area_collector",
+                                     !0, PRIORITY_NORMAL);
 	erts_literal_area_collector
 	    = (Process *) erts_ptab_pix2intptr_ddrb(&erts_proc,
 						    internal_pid_index(pid));
@@ -2222,14 +2232,35 @@ erl_start(int argc, char **argv)
 	       && erts_literal_area_collector->common.id == pid);
 	erts_proc_inc_refc(erts_literal_area_collector);
 
-	pid = erl_system_process_otp(otp_ring0_pid, "erts_dirty_process_code_checker", !0);
-	erts_dirty_process_code_checker
+	pid = erl_system_process_otp(erts_init_process_id,
+                                     "erts_dirty_process_signal_handler",
+                                     !0, PRIORITY_NORMAL);
+        erts_dirty_process_signal_handler
 	    = (Process *) erts_ptab_pix2intptr_ddrb(&erts_proc,
 						    internal_pid_index(pid));
-	ASSERT(erts_dirty_process_code_checker
-	       && erts_dirty_process_code_checker->common.id == pid);
-	erts_proc_inc_refc(erts_dirty_process_code_checker);
+	ASSERT(erts_dirty_process_signal_handler
+	       && erts_dirty_process_signal_handler->common.id == pid);
+	erts_proc_inc_refc(erts_dirty_process_signal_handler);
 
+	pid = erl_system_process_otp(erts_init_process_id,
+                                     "erts_dirty_process_signal_handler",
+                                     !0, PRIORITY_HIGH);
+        erts_dirty_process_signal_handler_high
+	    = (Process *) erts_ptab_pix2intptr_ddrb(&erts_proc,
+						    internal_pid_index(pid));
+	ASSERT(erts_dirty_process_signal_handler_high
+	       && erts_dirty_process_signal_handler_high->common.id == pid);
+	erts_proc_inc_refc(erts_dirty_process_signal_handler_high);
+
+	pid = erl_system_process_otp(erts_init_process_id,
+                                     "erts_dirty_process_signal_handler",
+                                     !0, PRIORITY_MAX);
+        erts_dirty_process_signal_handler_max
+	    = (Process *) erts_ptab_pix2intptr_ddrb(&erts_proc,
+						    internal_pid_index(pid));
+	ASSERT(erts_dirty_process_signal_handler_max
+	       && erts_dirty_process_signal_handler_max->common.id == pid);
+	erts_proc_inc_refc(erts_dirty_process_signal_handler_max);
     }
 
     erts_start_schedulers();

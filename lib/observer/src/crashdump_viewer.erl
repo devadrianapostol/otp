@@ -116,6 +116,10 @@
 -define(allocator,allocator).
 -define(atoms,atoms).
 -define(binary,binary).
+-define(dirty_cpu_scheduler,dirty_cpu_scheduler).
+-define(dirty_cpu_run_queue,dirty_cpu_run_queue).
+-define(dirty_io_scheduler,dirty_io_scheduler).
+-define(dirty_io_run_queue,dirty_io_run_queue).
 -define(ende,ende).
 -define(erl_crash_dump,erl_crash_dump).
 -define(ets,ets).
@@ -1222,6 +1226,18 @@ all_procinfo(Fd,Fun,Proc,WS,LineHead) ->
 	"OldHeap unused" ->
 	    Bytes = list_to_integer(bytes(Fd))*WS,
 	    get_procinfo(Fd,Fun,Proc#proc{old_heap_unused=Bytes},WS);
+	"BinVHeap" ->
+	    Bytes = list_to_integer(bytes(Fd))*WS,
+	    get_procinfo(Fd,Fun,Proc#proc{bin_vheap=Bytes},WS);
+	"OldBinVHeap" ->
+	    Bytes = list_to_integer(bytes(Fd))*WS,
+	    get_procinfo(Fd,Fun,Proc#proc{old_bin_vheap=Bytes},WS);
+	"BinVHeap unused" ->
+	    Bytes = list_to_integer(bytes(Fd))*WS,
+	    get_procinfo(Fd,Fun,Proc#proc{bin_vheap_unused=Bytes},WS);
+	"OldBinVHeap unused" ->
+	    Bytes = list_to_integer(bytes(Fd))*WS,
+	    get_procinfo(Fd,Fun,Proc#proc{old_bin_vheap_unused=Bytes},WS);
 	"New heap start" ->
 	    get_procinfo(Fd,Fun,Proc#proc{new_heap_start=bytes(Fd)},WS);
 	"New heap top" ->
@@ -1240,7 +1256,7 @@ all_procinfo(Fd,Fun,Proc,WS,LineHead) ->
 	"Last calls" ->
 	    get_procinfo(Fd,Fun,Proc#proc{last_calls=get_last_calls(Fd)},WS);
 	"Link list" ->
-	    {Links,Monitors,MonitoredBy} = parse_link_list(bytes(Fd),[],[],[]),
+	    {Links,Monitors,MonitoredBy} = get_link_list(Fd),
 	    get_procinfo(Fd,Fun,Proc#proc{links=Links,
 					  monitors=Monitors,
 					  mon_by=MonitoredBy},WS);
@@ -1322,86 +1338,64 @@ get_last_calls(Fd,<<>>,Acc,Lines) ->
 	    lists:reverse(Lines,[byte_list_to_string(lists:reverse(Acc))])
     end.
 
-parse_link_list([SB|Str],Links,Monitors,MonitoredBy) when SB==$[; SB==$] ->
-    parse_link_list(Str,Links,Monitors,MonitoredBy);
-parse_link_list("#Port"++_=Str,Links,Monitors,MonitoredBy) ->
-    {Link,Rest} = parse_port(Str),
-    parse_link_list(Rest,[Link|Links],Monitors,MonitoredBy);
-parse_link_list("<"++_=Str,Links,Monitors,MonitoredBy) ->
-    {Link,Rest} = parse_pid(Str),
-    parse_link_list(Rest,[Link|Links],Monitors,MonitoredBy);
-parse_link_list("{to,"++Str,Links,Monitors,MonitoredBy) ->
-    {Mon,Rest} = parse_monitor(Str),
-    parse_link_list(Rest,Links,[Mon|Monitors],MonitoredBy);
-parse_link_list("{from,"++Str,Links,Monitors,MonitoredBy) ->
-    {Mon,Rest} = parse_monitor(Str),
-    parse_link_list(Rest,Links,Monitors,[Mon|MonitoredBy]);
-parse_link_list(", "++Rest,Links,Monitors,MonitoredBy) ->
-    parse_link_list(Rest,Links,Monitors,MonitoredBy);
-parse_link_list([],Links,Monitors,MonitoredBy) ->
-    {lists:reverse(Links),lists:reverse(Monitors),lists:reverse(MonitoredBy)};
-parse_link_list(Unexpected,Links,Monitors,MonitoredBy) ->
-    io:format("WARNING: found unexpected data in link list:~n~ts~n",[Unexpected]),
-    parse_link_list([],Links,Monitors,MonitoredBy).
-
-
-parse_port(Str) ->
-    {Port,Rest} = parse_link(Str,[]),
-    {{Port,Port},Rest}.
-
-parse_pid(Str) ->
-    {Pid,Rest} = parse_link(Str,[]),
-    {{Pid,Pid},Rest}.
-
-parse_monitor("{"++Str) ->
-    %% Named process
-    {Name,Node,Rest1} = parse_name_node(Str,[]),
-    Pid = get_pid_from_name(Name,Node),
-    case parse_link(string:trim(Rest1,leading,","),[]) of
-	{Ref,"}"++Rest2} ->
-	    %% Bug in break.c - prints an extra "}" for remote
-	    %% nodes... thus the strip
-	    {{Pid,"{"++Name++","++Node++"} ("++Ref++")"},
-	     string:trim(Rest2,leading,"}")};
-	{Ref,[]} ->
-	    {{Pid,"{"++Name++","++Node++"} ("++Ref++")"},[]}
-    end;
-parse_monitor(Str) ->
-    case parse_link(Str,[]) of
-	{Pid,","++Rest1} ->
-	    case parse_link(Rest1,[]) of
-		{Ref,"}"++Rest2} ->
-		    {{Pid,Pid++" ("++Ref++")"},Rest2};
-		{Ref,[]} ->
-		    {{Pid,Pid++" ("++Ref++")"},[]}
-	    end;
-	{Pid,[]} ->
-	    {{Pid,Pid++" (unknown_ref)"},[]}
+get_link_list(Fd) ->
+    case get_chunk(Fd) of
+	{ok,<<"[",Bin/binary>>} ->
+            #{links:=Links,
+              mons:=Monitors,
+              mon_by:=MonitoredBy} =
+                get_link_list(Fd,Bin,#{links=>[],mons=>[],mon_by=>[]}),
+            {lists:reverse(Links),
+             lists:reverse(Monitors),
+             lists:reverse(MonitoredBy)};
+        eof ->
+            {[],[],[]}
     end.
 
-parse_link(">"++Rest,Acc) ->
-    {lists:reverse(Acc,">"),Rest};
-parse_link([H|T],Acc) ->
-    parse_link(T,[H|Acc]);
-parse_link([],Acc) ->
-    %% truncated
-    {lists:reverse(Acc),[]}.
+get_link_list(Fd,<<NL:8,_/binary>>=Bin,Acc) when NL=:=$\r; NL=:=$\n->
+    skip(Fd,Bin),
+    Acc;
+get_link_list(Fd,Bin,Acc) ->
+    case binary:split(Bin,[<<", ">>,<<"]">>]) of
+        [Link,Rest] ->
+            get_link_list(Fd,Rest,get_link(Link,Acc));
+        [Incomplete] ->
+            case get_chunk(Fd) of
+                {ok,More} ->
+                    get_link_list(Fd,<<Incomplete/binary,More/binary>>,Acc);
+                eof ->
+                    Acc
+            end
+    end.
 
-parse_name_node(","++Rest,Name) ->
-    parse_name_node(Rest,Name,[]);
-parse_name_node([H|T],Name) ->
-    parse_name_node(T,[H|Name]);
-parse_name_node([],Name) ->
-    %% truncated
-    {lists:reverse(Name),[],[]}.
+get_link(<<"#Port",_/binary>>=PortBin,#{links:=Links}=Acc) ->
+    PortStr = binary_to_list(PortBin),
+    Acc#{links=>[{PortStr,PortStr}|Links]};
+get_link(<<"<",_/binary>>=PidBin,#{links:=Links}=Acc) ->
+    PidStr = binary_to_list(PidBin),
+    Acc#{links=>[{PidStr,PidStr}|Links]};
+get_link(<<"{to,",Bin/binary>>,#{mons:=Monitors}=Acc) ->
+    Acc#{mons=>[parse_monitor(Bin)|Monitors]};
+get_link(<<"{from,",Bin/binary>>,#{mon_by:=MonitoredBy}=Acc) ->
+    Acc#{mon_by=>[parse_monitor(Bin)|MonitoredBy]};
+get_link(Unexpected,Acc) ->
+    io:format("WARNING: found unexpected data in link list:~n~ts~n",[Unexpected]),
+    Acc.
 
-parse_name_node("}"++Rest,Name,Node) ->
-    {lists:reverse(Name),lists:reverse(Node),Rest};
-parse_name_node([H|T],Name,Node) ->
-    parse_name_node(T,Name,[H|Node]);
-parse_name_node([],Name,Node) ->
-    %% truncated
-    {lists:reverse(Name),lists:reverse(Node),[]}.
+parse_monitor(MonBin) ->
+    case binary:split(MonBin,[<<",">>,<<"{">>,<<"}">>],[global]) of
+        [PidBin,RefBin,<<>>] ->
+            PidStr = binary_to_list(PidBin),
+            RefStr = binary_to_list(RefBin),
+            {PidStr,PidStr++" ("++RefStr++")"};
+        [<<>>,NameBin,NodeBin,<<>>,RefBin,<<>>] ->
+            %% Named process
+            NameStr = binary_to_list(NameBin),
+            NodeStr = binary_to_list(NodeBin),
+            PidStr = get_pid_from_name(NameStr,NodeStr),
+            RefStr = binary_to_list(RefBin),
+            {PidStr,"{"++NameStr++","++NodeStr++"} ("++RefStr++")"}
+    end.
 
 get_pid_from_name(Name,Node) ->
     case ets:lookup(cdv_reg_proc_table,cdv_dump_node_name) of
@@ -1654,6 +1648,10 @@ port_to_tuple("#Port<"++Port) ->
 
 get_portinfo(Fd,Port) ->
     case line_head(Fd) of
+        "State" ->
+	    get_portinfo(Fd,Port#port{state=bytes(Fd)});
+        "Task Flags" ->
+	    get_portinfo(Fd,Port#port{task_flags=bytes(Fd)});
 	"Slot" ->
 	    %% stored as integer so we can sort on it
 	    get_portinfo(Fd,Port#port{slot=list_to_integer(bytes(Fd))});
@@ -1678,6 +1676,10 @@ get_portinfo(Fd,Port) ->
 			    {Pid,Pid++" ("++Ref++")"}
 			end || Mon <- Monitors0],
 	    get_portinfo(Fd,Port#port{monitors=Monitors});
+        "Suspended" ->
+	    Pids = split_pid_list_no_space(bytes(Fd)),
+	    Suspended = [{Pid,Pid} || Pid <- Pids],
+	    get_portinfo(Fd,Port#port{suspended=Suspended});
 	"Port controls linked-in driver" ->
 	    Str = lists:flatten(["Linked in driver: " | string(Fd)]),
 	    get_portinfo(Fd,Port#port{controls=Str});
@@ -1693,6 +1695,15 @@ get_portinfo(Fd,Port) ->
 	"Port is UNIX fd not opened by emulator" ->
 	    Str = lists:flatten(["UNIX fd not opened by emulator: "| string(Fd)]),
 	    get_portinfo(Fd,Port#port{controls=Str});
+        "Input" ->
+	    get_portinfo(Fd,Port#port{input=list_to_integer(bytes(Fd))});
+        "Output" ->
+	    get_portinfo(Fd,Port#port{output=list_to_integer(bytes(Fd))});
+        "Queue" ->
+	    get_portinfo(Fd,Port#port{queue=list_to_integer(bytes(Fd))});
+        "Port Data" ->
+	    get_portinfo(Fd,Port#port{port_data=string(Fd)});
+
 	"=" ++ _next_tag ->
 	    Port;
 	Other ->
@@ -2029,12 +2040,16 @@ all_modinfo(Fd,LM,LineHead,DecodeOpts) ->
     end.
 
 get_attribute(Fd, DecodeOpts) ->
+    Term = do_get_attribute(Fd, DecodeOpts),
+    io_lib:format("~tp~n",[Term]).
+
+do_get_attribute(Fd, DecodeOpts) ->
     Bytes = bytes(Fd, ""),
     try get_binary(Bytes, DecodeOpts) of
         {Bin,_} ->
             try binary_to_term(Bin) of
                 Term ->
-                    io_lib:format("~tp~n",[Term])
+                    Term
             catch
                 _:_ ->
                     {"WARNING: The term is probably truncated!",
@@ -2521,73 +2536,142 @@ get_indextableinfo1(Fd,IndexTable) ->
 %%-----------------------------------------------------------------
 %% Page with scheduler table information
 schedulers(File) ->
-    case lookup_index(?scheduler) of
-	[] ->
-	    [];
-	Schedulers ->
-	    Fd = open(File),
-	    R = lists:map(fun({Name,Start}) ->
-				  get_schedulerinfo(Fd,Name,Start)
-			  end,
-			  Schedulers),
-	    close(Fd),
-	    R
+    Fd = open(File),
+
+    Schds0 = case lookup_index(?scheduler) of
+                 [] ->
+                     [];
+                 Normals ->
+                     [{Normals, #sched{type=normal}}]
+             end,
+    Schds1 = case lookup_index(?dirty_cpu_scheduler) of
+                 [] ->
+                     Schds0;
+                 DirtyCpus ->
+                     [{DirtyCpus, get_dirty_runqueue(Fd, ?dirty_cpu_run_queue)}
+                      | Schds0]
+             end,
+    Schds2 = case lookup_index(?dirty_io_scheduler) of
+                 [] ->
+                     Schds1;
+                 DirtyIos ->
+                     [{DirtyIos, get_dirty_runqueue(Fd, ?dirty_io_run_queue)}
+                      | Schds1]
+             end,
+
+    R = schedulers1(Fd, Schds2, []),
+    close(Fd),
+    R.
+
+schedulers1(_Fd, [], Acc) ->
+    Acc;
+schedulers1(Fd, [{Scheds,Sched0} | Tail], Acc0) ->
+    Acc1 = lists:foldl(fun({Name,Start}, AccIn) ->
+                               [get_schedulerinfo(Fd,Name,Start,Sched0) | AccIn]
+                       end,
+                       Acc0,
+                       Scheds),
+    schedulers1(Fd, Tail, Acc1).
+
+get_schedulerinfo(Fd,Name,Start,Sched0) ->
+    pos_bof(Fd,Start),
+    get_schedulerinfo1(Fd,Sched0#sched{name=list_to_integer(Name)}).
+
+sched_type(?dirty_cpu_run_queue) -> dirty_cpu;
+sched_type(?dirty_io_run_queue) ->  dirty_io.
+
+get_schedulerinfo1(Fd, Sched) ->
+    case get_schedulerinfo2(Fd, Sched) of
+        {more, Sched2} ->
+            get_schedulerinfo1(Fd, Sched2);
+        {done, Sched2} ->
+            Sched2
     end.
 
-get_schedulerinfo(Fd,Name,Start) ->
-    pos_bof(Fd,Start),
-    get_schedulerinfo1(Fd,#sched{name=Name}).
-
-get_schedulerinfo1(Fd,Sched=#sched{details=Ds}) ->
+get_schedulerinfo2(Fd, Sched=#sched{details=Ds}) ->
     case line_head(Fd) of
 	"Current Process" ->
-	    get_schedulerinfo1(Fd,Sched#sched{process=bytes(Fd, "None")});
+	    {more, Sched#sched{process=bytes(Fd, "None")}};
 	"Current Port" ->
-	    get_schedulerinfo1(Fd,Sched#sched{port=bytes(Fd, "None")});
+	    {more, Sched#sched{port=bytes(Fd, "None")}};
+
+	"Scheduler Sleep Info Flags" ->
+	    {more, Sched#sched{details=Ds#{sleep_info=>bytes(Fd, "None")}}};
+	"Scheduler Sleep Info Aux Work" ->
+	    {more, Sched#sched{details=Ds#{sleep_aux=>bytes(Fd, "None")}}};
+
+	"Current Process State" ->
+	    {more, Sched#sched{details=Ds#{currp_state=>bytes(Fd)}}};
+	"Current Process Internal State" ->
+	    {more, Sched#sched{details=Ds#{currp_int_state=>bytes(Fd)}}};
+	"Current Process Program counter" ->
+	    {more, Sched#sched{details=Ds#{currp_prg_cnt=>string(Fd)}}};
+	"Current Process CP" ->
+	    {more, Sched#sched{details=Ds#{currp_cp=>string(Fd)}}};
+	"Current Process Limited Stack Trace" ->
+	    %% If there shall be last in scheduler information block
+	    {done, Sched#sched{details=get_limited_stack(Fd, 0, Ds)}};
+
+	"=" ++ _next_tag ->
+            {done, Sched};
+
+	Other ->
+            case Sched#sched.type of
+                normal ->
+                    get_runqueue_info2(Fd, Other, Sched);
+                _ ->
+                    unexpected(Fd,Other,"dirty scheduler information"),
+                    {done, Sched}
+            end
+    end.
+
+get_dirty_runqueue(Fd, Tag) ->
+    case lookup_index(Tag) of
+        [{_, Start}] ->
+            pos_bof(Fd,Start),
+            get_runqueue_info1(Fd,#sched{type=sched_type(Tag)});
+        [] ->
+            #sched{}
+    end.
+
+get_runqueue_info1(Fd, Sched) ->
+    case get_runqueue_info2(Fd, line_head(Fd), Sched) of
+        {more, Sched2} ->
+            get_runqueue_info1(Fd, Sched2);
+        {done, Sched2} ->
+            Sched2
+    end.
+
+get_runqueue_info2(Fd, LineHead, Sched=#sched{details=Ds}) ->
+    case LineHead of
 	"Run Queue Max Length" ->
 	    RQMax = list_to_integer(bytes(Fd)),
 	    RQ = RQMax + Sched#sched.run_q,
-	    get_schedulerinfo1(Fd,Sched#sched{run_q=RQ, details=Ds#{runq_max=>RQMax}});
+	    {more, Sched#sched{run_q=RQ, details=Ds#{runq_max=>RQMax}}};
 	"Run Queue High Length" ->
 	    RQHigh = list_to_integer(bytes(Fd)),
 	    RQ = RQHigh + Sched#sched.run_q,
-	    get_schedulerinfo1(Fd,Sched#sched{run_q=RQ, details=Ds#{runq_high=>RQHigh}});
+	    {more, Sched#sched{run_q=RQ, details=Ds#{runq_high=>RQHigh}}};
 	"Run Queue Normal Length" ->
 	    RQNorm = list_to_integer(bytes(Fd)),
 	    RQ = RQNorm + Sched#sched.run_q,
-	    get_schedulerinfo1(Fd,Sched#sched{run_q=RQ, details=Ds#{runq_norm=>RQNorm}});
+	    {more, Sched#sched{run_q=RQ, details=Ds#{runq_norm=>RQNorm}}};
 	"Run Queue Low Length" ->
 	    RQLow = list_to_integer(bytes(Fd)),
 	    RQ = RQLow + Sched#sched.run_q,
-	    get_schedulerinfo1(Fd,Sched#sched{run_q=RQ, details=Ds#{runq_low=>RQLow}});
+	    {more, Sched#sched{run_q=RQ, details=Ds#{runq_low=>RQLow}}};
 	"Run Queue Port Length" ->
 	    RQ = list_to_integer(bytes(Fd)),
-	    get_schedulerinfo1(Fd,Sched#sched{port_q=RQ});
-
-	"Scheduler Sleep Info Flags" ->
-	    get_schedulerinfo1(Fd,Sched#sched{details=Ds#{sleep_info=>bytes(Fd, "None")}});
-	"Scheduler Sleep Info Aux Work" ->
-	    get_schedulerinfo1(Fd,Sched#sched{details=Ds#{sleep_aux=>bytes(Fd, "None")}});
+	    {more, Sched#sched{port_q=RQ}};
 
 	"Run Queue Flags" ->
-	    get_schedulerinfo1(Fd,Sched#sched{details=Ds#{runq_flags=>bytes(Fd, "None")}});
+	    {more, Sched#sched{details=Ds#{runq_flags=>bytes(Fd, "None")}}};
 
-	"Current Process State" ->
-	    get_schedulerinfo1(Fd,Sched#sched{details=Ds#{currp_state=>bytes(Fd)}});
-	"Current Process Internal State" ->
-	    get_schedulerinfo1(Fd,Sched#sched{details=Ds#{currp_int_state=>bytes(Fd)}});
-	"Current Process Program counter" ->
-	    get_schedulerinfo1(Fd,Sched#sched{details=Ds#{currp_prg_cnt=>string(Fd)}});
-	"Current Process CP" ->
-	    get_schedulerinfo1(Fd,Sched#sched{details=Ds#{currp_cp=>string(Fd)}});
-	"Current Process Limited Stack Trace" ->
-	    %% If there shall be last in scheduler information block
-	    Sched#sched{details=get_limited_stack(Fd, 0, Ds)};
 	"=" ++ _next_tag ->
-	    Sched;
+            {done, Sched};
 	Other ->
 	    unexpected(Fd,Other,"scheduler information"),
-	    Sched
+	    {done, Sched}
     end.
 
 get_limited_stack(Fd, N, Ds) ->
@@ -3018,6 +3102,10 @@ tag_to_atom("allocated_areas") -> ?allocated_areas;
 tag_to_atom("allocator") -> ?allocator;
 tag_to_atom("atoms") -> ?atoms;
 tag_to_atom("binary") -> ?binary;
+tag_to_atom("dirty_cpu_scheduler") -> ?dirty_cpu_scheduler;
+tag_to_atom("dirty_cpu_run_queue") -> ?dirty_cpu_run_queue;
+tag_to_atom("dirty_io_scheduler") -> ?dirty_io_scheduler;
+tag_to_atom("dirty_io_run_queue") -> ?dirty_io_run_queue;
 tag_to_atom("end") -> ?ende;
 tag_to_atom("erl_crash_dump") -> ?erl_crash_dump;
 tag_to_atom("ets") -> ?ets;

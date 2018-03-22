@@ -1,7 +1,7 @@
 %%
 %% %CopyrightBegin%
 %%
-%% Copyright Ericsson AB 1996-2017. All Rights Reserved.
+%% Copyright Ericsson AB 1996-2018. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -645,8 +645,7 @@ eval_exprs(Es, Shell, Bs0, RT, Lf, Ef, W) ->
     catch 
         exit:normal ->
             exit(normal);
-        Class:Reason ->
-            Stacktrace = erlang:get_stacktrace(),
+        Class:Reason:Stacktrace ->
             M = {self(),Class,{Reason,Stacktrace}},
             case do_catch(Class, Reason) of
                 true ->
@@ -701,7 +700,9 @@ exprs([E0|Es], Bs1, RT, Lf, Ef, Bs0, W) ->
                                 {W,V0};
                             true -> case result_will_be_saved() of
                                      true -> V0;
-                                     false -> ignored
+                                     false ->
+                                         erlang:garbage_collect(),
+                                         ignored
                                  end
                         end,
                     {{value,V,Bs,get()},Bs};
@@ -805,8 +806,8 @@ restrict_handlers(RShMod, Shell, RT) ->
 
 -define(BAD_RETURN(M, F, V),
         try erlang:error(reason)
-        catch _:_ -> erlang:raise(exit, {restricted_shell_bad_return,V}, 
-                                  [{M,F,3} | erlang:get_stacktrace()])
+        catch _:_:S -> erlang:raise(exit, {restricted_shell_bad_return,V}, 
+                                    [{M,F,3} | S])
         end).
 
 local_allowed(F, As, RShMod, Bs, Shell, RT) when is_atom(F) ->

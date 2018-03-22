@@ -605,6 +605,16 @@ trans_fun([{get_list,List,Head,Tail}|Instructions], Env) ->
       ?error_msg("hd and tl regs identical in get_list~n",[]),
       erlang:error(not_handled)
   end;
+%%--- get_hd ---
+trans_fun([{get_hd,List,Head}|Instructions], Env) ->
+  TransList = [trans_arg(List)],
+  I = hipe_icode:mk_primop([mk_var(Head)],unsafe_hd,TransList),
+  [I | trans_fun(Instructions,Env)];
+%%--- get_tl ---
+trans_fun([{get_tl,List,Tail}|Instructions], Env) ->
+  TransList = [trans_arg(List)],
+  I = hipe_icode:mk_primop([mk_var(Tail)],unsafe_tl,TransList),
+  [I | trans_fun(Instructions,Env)];
 %%--- get_tuple_element ---
 trans_fun([{get_tuple_element,Xreg,Index,Dst}|Instructions], Env) ->
   I = hipe_icode:mk_primop([mk_var(Dst)],
@@ -1163,6 +1173,12 @@ trans_fun([{put_map_exact,{f,Lbl},Map,Dst,_N,{list,Pairs}}|Instructions], Env) -
 trans_fun([build_stacktrace|Instructions], Env) ->
   Vars = [mk_var({x,0})], %{x,0} is implict arg and dst
   [hipe_icode:mk_primop(Vars,build_stacktrace,Vars),
+   trans_fun(Instructions, Env)];
+%%--- raw_raise ---
+trans_fun([raw_raise|Instructions], Env) ->
+  Vars = [mk_var({x,0}),mk_var({x,1}),mk_var({x,2})],
+  Dst = [mk_var({x,0})],
+  [hipe_icode:mk_primop(Dst,raw_raise,Vars) |
    trans_fun(Instructions, Env)];
 %%--------------------------------------------------------------------
 %%--- ERROR HANDLING ---

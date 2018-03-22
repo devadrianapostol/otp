@@ -3152,6 +3152,9 @@ tailrecur_ne:
 		    int cmp;
 		    byte* a_ptr;
 		    byte* b_ptr;
+		    if (eq_only && a_size != b_size) {
+		        RETURN_NEQ(a_size - b_size);
+		    }
 		    ERTS_GET_BINARY_BYTES(a, a_ptr, a_bitoffs, a_bitsize);
 		    ERTS_GET_BINARY_BYTES(b, b_ptr, b_bitoffs, b_bitsize);
 		    if ((a_bitsize | b_bitsize | a_bitoffs | b_bitoffs) == 0) {
@@ -4360,15 +4363,20 @@ erts_read_env(char *key)
     char *value = erts_alloc(ERTS_ALC_T_TMP, value_len);
     int res;
     while (1) {
-	res = erts_sys_getenv_raw(key, value, &value_len);
-	if (res <= 0)
-	    break;
-	value = erts_realloc(ERTS_ALC_T_TMP, value, value_len);
+        res = erts_sys_explicit_8bit_getenv(key, value, &value_len);
+
+        if (res >= 0) {
+            break;
+        }
+
+        value = erts_realloc(ERTS_ALC_T_TMP, value, value_len);
     }
-    if (res != 0) {
-	erts_free(ERTS_ALC_T_TMP, value);
-	return NULL;
+
+    if (res != 1) {
+        erts_free(ERTS_ALC_T_TMP, value);
+        return NULL;
     }
+
     return value;
 }
 

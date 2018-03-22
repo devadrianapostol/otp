@@ -145,14 +145,9 @@ find_fixpoint(OptFun, Core0, Max) ->
 body(Body, Sub) ->
     body(Body, value, Sub).
 
-body(#c_values{anno=A,es=Es0}, Ctxt, Sub) ->
-    Es1 = expr_list(Es0, Ctxt, Sub),
-    case Ctxt of
-	value ->
-	    #c_values{anno=A,es=Es1};
-	effect ->
-	    make_effect_seq(Es1, Sub)
-    end;
+body(#c_values{anno=A,es=Es0}, value, Sub) ->
+    Es1 = expr_list(Es0, value, Sub),
+    #c_values{anno=A,es=Es1};
 body(E, Ctxt, Sub) ->
     ?ASSERT(verify_scope(E, Sub)),
     expr(E, Ctxt, Sub).
@@ -313,9 +308,15 @@ expr(#c_seq{arg=Arg0,body=B0}=Seq0, Ctxt, Sub) ->
 	false ->
 	    %% Arg cannot be "values" here - only a single value
 	    %% make sense here.
-	    case is_safe_simple(Arg, Sub) of
-		true -> B1;
-		false -> Seq0#c_seq{arg=Arg,body=B1}
+            case {Ctxt,is_safe_simple(Arg, Sub)} of
+                {effect,true} -> B1;
+                {effect,false} ->
+                    case is_safe_simple(B1, Sub) of
+                        true -> Arg;
+                        false -> Seq0#c_seq{arg=Arg,body=B1}
+                    end;
+                {value,true} -> B1;
+                {value,false} -> Seq0#c_seq{arg=Arg,body=B1}
 	    end
     end;
 expr(#c_let{}=Let0, Ctxt, Sub) ->
@@ -379,10 +380,7 @@ expr(#c_case{}=Case0, Ctxt, Sub) ->
 	    Case = Case1#c_case{arg=Arg2,clauses=Cs2},
 	    warn_no_clause_match(Case1, Case),
 	    Expr = eval_case(Case, Sub),
-            case move_case_into_arg(Case, Sub) of
-                impossible -> Expr;
-                Other -> Other
-            end;
+            move_case_into_arg(Expr, Sub);
 	Other ->
 	    expr(Other, Ctxt, Sub)
     end;
@@ -2509,6 +2507,72 @@ are_all_failing_clauses(Cs) ->
 is_failing_clause(#c_clause{body=B}) ->
     will_fail(B).
 
+%% opt_build_stacktrace(Let) -> Core.
+%%  If the stacktrace is *only* used in a call to erlang:raise/3,
+%%  there is no need to build a cooked stackframe using build_stacktrace/1.
+
+opt_build_stacktrace(#c_let{vars=[#c_var{name=Cooked}],
+                            arg=#c_primop{name=#c_literal{val=build_stacktrace},
+                                          args=[RawStk]},
+                            body=Body}=Let) ->
+    case Body of
+        #c_call{module=#c_literal{val=erlang},
+                name=#c_literal{val=raise},
+                args=[Class,Exp,#c_var{name=Cooked}]} ->
+            %% The stacktrace is only used in a call to erlang:raise/3.
+            %% There is no need to build the stacktrace. Replace the
+            %% call to erlang:raise/3 with the the raw_raise/3 instruction,
+            %% which will use a raw stacktrace.
+            #c_primop{name=#c_literal{val=raw_raise},
+                      args=[Class,Exp,RawStk]};
+        #c_let{vars=[#c_var{name=V}],arg=Arg,body=B0} when V =/= Cooked ->
+            case core_lib:is_var_used(Cooked, Arg) of
+                false ->
+                    %% The built stacktrace is not used in the argument,
+                    %% so we can sink the building of the stacktrace into
+                    %% the body of the let.
+                    B = opt_build_stacktrace(Let#c_let{body=B0}),
+                    Body#c_let{body=B};
+                true ->
+                    Let
+            end;
+        #c_seq{arg=Arg,body=B0} ->
+            case core_lib:is_var_used(Cooked, Arg) of
+                false ->
+                    %% The built stacktrace is not used in the argument,
+                    %% so we can sink the building of the stacktrace into
+                    %% the body of the sequence.
+                    B = opt_build_stacktrace(Let#c_let{body=B0}),
+                    Body#c_seq{body=B};
+                true ->
+                    Let
+            end;
+        #c_case{arg=Arg,clauses=Cs0} ->
+            case core_lib:is_var_used(Cooked, Arg) orelse
+                is_used_in_any_guard(Cooked, Cs0) of
+                false ->
+                    %% The built stacktrace is not used in the argument,
+                    %% so we can sink the building of the stacktrace into
+                    %% each arm of the case.
+                    Cs = [begin
+                              B = opt_build_stacktrace(Let#c_let{body=B0}),
+                              C#c_clause{body=B}
+                          end || #c_clause{body=B0}=C <- Cs0],
+                    Body#c_case{clauses=Cs};
+                true ->
+                    Let
+            end;
+        _ ->
+            Let
+    end;
+opt_build_stacktrace(Expr) ->
+    Expr.
+
+is_used_in_any_guard(V, Cs) ->
+    any(fun(#c_clause{guard=G}) ->
+                core_lib:is_var_used(V, G)
+        end, Cs).
+
 %% opt_case_in_let(Let) -> Let'
 %%  Try to avoid building tuples that are immediately matched.
 %%  A common pattern is:
@@ -2664,53 +2728,94 @@ opt_simple_let_1(#c_let{vars=Vs0,body=B0}=Let, Arg0, Ctxt, Sub0) ->
     %% Optimise let and add new substitutions.
     {Vs,Args,Sub1} = let_substs(Vs0, Arg0, Sub0),
     BodySub = update_let_types(Vs, Args, Sub1),
+    Sub = Sub1#sub{v=[],s=cerl_sets:new()},
     B = body(B0, Ctxt, BodySub),
     Arg = core_lib:make_values(Args),
-    opt_simple_let_2(Let, Vs, Arg, B, B0, Ctxt, Sub1).
+    opt_simple_let_2(Let, Vs, Arg, B, B0, Sub).
 
-opt_simple_let_2(Let0, Vs0, Arg0, Body, PrevBody, Ctxt, Sub) ->
+
+%% opt_simple_let_2(Let0, Vs0, Arg0, Body, PrevBody, Ctxt, Sub) -> Core.
+%%  Do final simplifications of the let.
+%%
+%%  Note that the substitutions and scope in Sub have been cleared
+%%  and should not be used.
+
+opt_simple_let_2(Let0, Vs0, Arg0, Body, PrevBody, Sub) ->
     case {Vs0,Arg0,Body} of
-	{[#c_var{name=N1}],Arg1,#c_var{name=N2}} ->
-	    case N1 =:= N2 of
-		true ->
-		    %% let <Var> = Arg in <Var>  ==>  Arg
-		    Arg1;
-		false ->
-		    %% let <Var> = Arg in <OtherVar>  ==>  seq Arg OtherVar
-		    Arg = maybe_suppress_warnings(Arg1, Vs0, PrevBody),
-		    #c_seq{arg=Arg,body=Body}
-	    end;
+	{[#c_var{name=V}],Arg1,#c_var{name=V}} ->
+            %% let <Var> = Arg in <Var>  ==>  Arg
+            Arg1;
 	{[],#c_values{es=[]},_} ->
 	    %% No variables left.
 	    Body;
-	{Vs,Arg1,#c_literal{}} ->
-	    Arg = maybe_suppress_warnings(Arg1, Vs, PrevBody),
-	    case Ctxt of
-		effect ->
-		    %% Throw away the literal body.
-		    Arg;
-		value ->
-		    %% Since the variable is not used in the body, we
-		    %% can rewrite the let to a sequence.
-		    %%  let <Var> = Arg in Literal ==> seq Arg Literal
-		    #c_seq{arg=Arg,body=Body}
-	    end;
-	{Vs,Arg1,Body} ->
-	    %% If none of the variables are used in the body, we can
-	    %% rewrite the let to a sequence:
-	    %%    let <Var> = Arg in BodyWithoutVar ==>
-	    %%        seq Arg BodyWithoutVar
-	    case is_any_var_used(Vs, Body) of
-		false ->
-		    Arg = maybe_suppress_warnings(Arg1, Vs, PrevBody),
-		    #c_seq{arg=Arg,body=Body};
-		true ->
-		    Let1 = Let0#c_let{vars=Vs,arg=Arg1,body=Body},
-		    opt_bool_case_in_let(Let1, Sub)
+	{[#c_var{name=V}=Var|Vars]=Vars0,Arg1,Body} ->
+            case core_lib:is_var_used(V, Body) of
+                false when Vars =:= [] ->
+                    %% If the variable is not used in the body, we can
+                    %% rewrite the let to a sequence:
+                    %%    let <Var> = Arg in BodyWithoutVar ==>
+                    %%        seq Arg BodyWithoutVar
+                    Arg = maybe_suppress_warnings(Arg1, Var, PrevBody),
+                    #c_seq{arg=Arg,body=Body};
+                false ->
+                    %% There are multiple values returned by the argument
+                    %% and the first value is not used (this is a 'case'
+                    %% with exported variables, but the return value is
+                    %% ignored). We can remove the first variable and the
+                    %% the first value returned from the 'let' argument.
+                    Arg2 = remove_first_value(Arg1, Sub),
+                    Let1 = Let0#c_let{vars=Vars,arg=Arg2,body=Body},
+                    post_opt_let(Let1, Sub);
+                true ->
+                    Let1 = Let0#c_let{vars=Vars0,arg=Arg1,body=Body},
+                    post_opt_let(Let1, Sub)
 	    end
     end.
 
-%% maybe_suppress_warnings(Arg, [#c_var{}], PreviousBody) -> Arg'
+%% post_opt_let(Let, Sub)
+%%  Final optimizations of the let.
+%%
+%%  Note that the substitutions and scope in Sub have been cleared
+%%  and should not be used.
+
+post_opt_let(Let0, Sub) ->
+    Let1 = opt_bool_case_in_let(Let0, Sub),
+    opt_build_stacktrace(Let1).
+
+
+%% remove_first_value(Core0, Sub) -> Core.
+%%  Core0 is an expression that returns at least two values.
+%%  Remove the first value returned from Core0.
+
+remove_first_value(#c_values{es=[V|Vs]}, Sub) ->
+    Values = core_lib:make_values(Vs),
+    case is_safe_simple(V, Sub) of
+        false ->
+            #c_seq{arg=V,body=Values};
+        true ->
+            Values
+    end;
+remove_first_value(#c_case{clauses=Cs0}=Core, Sub) ->
+    Cs = remove_first_value_cs(Cs0, Sub),
+    Core#c_case{clauses=Cs};
+remove_first_value(#c_receive{clauses=Cs0,action=Act0}=Core, Sub) ->
+    Cs = remove_first_value_cs(Cs0, Sub),
+    Act = remove_first_value(Act0, Sub),
+    Core#c_receive{clauses=Cs,action=Act};
+remove_first_value(#c_let{body=B}=Core, Sub) ->
+    Core#c_let{body=remove_first_value(B, Sub)};
+remove_first_value(#c_seq{body=B}=Core, Sub) ->
+    Core#c_seq{body=remove_first_value(B, Sub)};
+remove_first_value(#c_primop{}=Core, _Sub) ->
+    Core;
+remove_first_value(#c_call{}=Core, _Sub) ->
+    Core.
+
+remove_first_value_cs(Cs, Sub) ->
+    [C#c_clause{body=remove_first_value(B, Sub)} ||
+        #c_clause{body=B}=C <- Cs].
+
+%% maybe_suppress_warnings(Arg, #c_var{}, PreviousBody) -> Arg'
 %%  Try to suppress false warnings when a variable is not used.
 %%  For instance, we don't expect a warning for useless building in:
 %%
@@ -2721,12 +2826,12 @@ opt_simple_let_2(Let0, Vs0, Arg0, Body, PrevBody, Ctxt, Sub) ->
 %%  referenced in the original unoptimized code. If they were, we will
 %%  consider the warning false and suppress it.
 
-maybe_suppress_warnings(Arg, Vs, PrevBody) ->
+maybe_suppress_warnings(Arg, #c_var{name=V}, PrevBody) ->
     case should_suppress_warning(Arg) of
 	true ->
 	    Arg;				%Already suppressed.
 	false ->
-	    case is_any_var_used(Vs, PrevBody) of
+	    case core_lib:is_var_used(V, PrevBody) of
 		true ->
 		    suppress_warning([Arg]);
 		false ->
@@ -2815,7 +2920,7 @@ move_case_into_arg(#c_case{arg=#c_case{arg=OuterArg,
 	    Outer#c_case{arg=OuterArg,
 			 clauses=[OuterCa,OuterCb]};
         false ->
-            impossible
+            Inner0
     end;
 move_case_into_arg(#c_case{arg=#c_seq{arg=OuterArg,body=InnerArg}=Outer,
                            clauses=InnerClauses}=Inner, _Sub) ->
@@ -2831,15 +2936,8 @@ move_case_into_arg(#c_case{arg=#c_seq{arg=OuterArg,body=InnerArg}=Outer,
     %%
     Outer#c_seq{arg=OuterArg,
                 body=Inner#c_case{arg=InnerArg,clauses=InnerClauses}};
-move_case_into_arg(_, _) ->
-    impossible.
-
-is_any_var_used([#c_var{name=V}|Vs], Expr) ->
-    case core_lib:is_var_used(V, Expr) of
-	false -> is_any_var_used(Vs, Expr);
-	true -> true
-    end;
-is_any_var_used([], _) -> false.
+move_case_into_arg(Expr, _) ->
+    Expr.
 
 %%%
 %%% Retrieving information about types.

@@ -1356,12 +1356,16 @@ error
 ],[
  AC_MSG_RESULT(no)
 ])
+
+if test "$Z_LIB" != ""; then
+  AC_MSG_CHECKING(for zlib inflateGetDictionary presence)
+  AC_SEARCH_LIBS(inflateGetDictionary, [z],
+                 AC_DEFINE(HAVE_ZLIB_INFLATEGETDICTIONARY, 1,
+                           [Define if your zlib version defines inflateGetDictionary.]))
+fi
+
 LIBS=$zlib_save_LIBS
 
-AC_MSG_CHECKING(for zlib inflateGetDictionary presence)
-AC_SEARCH_LIBS(inflateGetDictionary, [z],
-               AC_DEFINE(HAVE_ZLIB_INFLATEGETDICTIONARY, 1,
-                         [Define if your zlib version defines inflateGetDictionary.]))
 fi
 AC_SUBST(Z_LIB)
 
@@ -1756,6 +1760,25 @@ if test $ac_cv_sizeof_void_p = 8; then
 fi
 AC_SUBST(BITS64)
 
+AC_MSG_CHECKING([for C compiler 'restrict' support])
+restrict_keyword=""
+for x in restrict __restrict; do
+    AC_TRY_COMPILE([int * $x foo(int * $x arg);
+		    int * $x foo(int * $x arg)
+		        { int * $x var=arg; return var;}
+		   ],[],
+		   [restrict_keyword=$x],[])
+    if test "x$restrict_keyword" != "x"; then
+	break
+    fi
+done
+AC_DEFINE_UNQUOTED(ERTS_RESTRICT,[$restrict_keyword],[Type qualifier restrict])
+if test "x$restrict_keyword" != "x"; then
+   AC_MSG_RESULT(yes)
+else
+   AC_MSG_RESULT(no)
+fi
+
 if test "x$ac_compiler_gnu" = "xyes"; then
 AC_MSG_CHECKING([if we should add -fno-tree-copyrename to CFLAGS for computed gotos to work properly])
 AC_TRY_COMPILE([],[
@@ -1774,8 +1797,6 @@ if test "x$no_tree_copyrename" = "xyes"; then
 else
 	AC_MSG_RESULT(no)
 fi
-
-
 
 AC_MSG_CHECKING([for broken gcc-4.3.0 compiler])
 AC_TRY_RUN([
@@ -2700,6 +2721,13 @@ LIBS=$saved_libs
 dnl restore CPPFLAGS
 CPPFLAGS=$saved_cppflags
 
+case $ARCH in
+     x86|amd64)
+	AC_DEFINE(ERTS_STRUCTURE_ALIGNED_ALLOC, 1, [Define if structure alignment is enough for allocators. If not defined, 64-bit alignment will be forced.]);;
+     *)
+	;;
+esac
+
 LM_SYS_IPV6
 LM_SYS_MULTICAST
 ERL_TIME_CORRECTION
@@ -2743,23 +2771,6 @@ if test "$cross_compiling" != "yes" && test X${enable_hipe} != Xno; then
       		;;	
   	esac
   fi
-fi
-
-dnl Check to disable -fPIE and friends for HiPE on amd64
-if test X${enable_hipe} = Xyes && test X$ARCH = Xamd64; then
-   AC_TRY_COMPILE(, [#if defined(__pie__) || defined(__PIE__)
-		     #error -fPIE is enabled by default
-		     #endif],
-		    [AC_MSG_NOTICE([No -fPIE enabled by default])],
-		    [AC_MSG_WARN([Security feature -fPIE will be disabled for HiPE])
-		     STATIC_CFLAGS="-fno-PIE $STATIC_CFLAGS"
-		     saved_LDFLAGS=$LDFLAGS
-		     LDFLAGS="-no-pie $LDFLAGS"
-		     AC_TRY_LINK(,, [],
-			[LDFLAGS="-fno-PIE $saved_LDFLAGS"
-			 AC_TRY_LINK(,, [],
-			    [AC_MSG_WARN([Linked does not accept option -no-pie nor -fno-PIE])
-			     LDFLAGS=$saved_LDFLAGS])])])
 fi
 
 if test X${enable_hipe} = Xyes; then

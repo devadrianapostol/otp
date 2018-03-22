@@ -299,7 +299,7 @@ traverse(Tree, Map, State) ->
 	  match_fail -> t_none();
 	  raise -> t_none();
 	  bs_init_writable -> t_from_term(<<>>);
-          build_stacktrace -> t_list();
+          build_stacktrace -> erl_bif_types:type(erlang, build_stacktrace, 0);
 	  Other -> erlang:error({'Unsupported primop', Other})
 	end,
       {State, Map, Type};
@@ -1234,6 +1234,13 @@ handle_tuple(Tree, Map, State) ->
                                     format_type(ErrorType, State1),
                                   OpaqueStr, OpaqueStr]},
                           State2 = state__add_warning(State1, ?WARN_OPAQUE,
+                                                      Tree, Msg),
+                          {State2, Map1, t_none()};
+                        {error, record, ErrorPat, ErrorType, _} ->
+                          Msg = {record_match,
+                                 [format_patterns(ErrorPat),
+                                  format_type(ErrorType, State1)]},
+                          State2 = state__add_warning(State1, ?WARN_MATCHING,
                                                       Tree, Msg),
                           {State2, Map1, t_none()};
                         {Map2, ETypes} ->
@@ -3117,7 +3124,10 @@ state__add_warning(#state{warnings = Warnings, warning_mode = true} = State,
 state__remove_added_warnings(OldState, NewState) ->
   #state{warnings = OldWarnings} = OldState,
   #state{warnings = NewWarnings} = NewState,
-  {NewWarnings -- OldWarnings, NewState#state{warnings = OldWarnings}}.
+  case NewWarnings =:= OldWarnings of
+    true -> {[], NewState};
+    false -> {NewWarnings -- OldWarnings, NewState#state{warnings = OldWarnings}}
+  end.
 
 state__add_warnings(Warns, #state{warnings = Warnings} = State) ->
   State#state{warnings = Warns ++ Warnings}.
@@ -3434,19 +3444,19 @@ state__fun_info(Fun, #state{callgraph = CG, fun_tab = FunTab, plt = PLT}) ->
   {Fun, Sig, Contract, LocalRet}.
 
 forward_args(Fun, ArgTypes, #state{work = Work, fun_tab = FunTab} = State) ->
-  {OldArgTypes, OldOut, Fixpoint} =
+  {NewArgTypes, OldOut, Fixpoint} =
     case dict:find(Fun, FunTab) of
-      {ok, {not_handled, {OldArgTypes0, OldOut0}}} ->
-	{OldArgTypes0, OldOut0, false};
+      {ok, {not_handled, {_OldArgTypesAreNone, OldOut0}}} ->
+	{ArgTypes, OldOut0, false};
       {ok, {OldArgTypes0, OldOut0}} ->
-	{OldArgTypes0, OldOut0,
-	 t_is_subtype(t_product(ArgTypes), t_product(OldArgTypes0))}
+        NewArgTypes0 = [t_sup(X, Y) ||
+                         {X, Y} <- lists:zip(ArgTypes, OldArgTypes0)],
+	{NewArgTypes0, OldOut0,
+         t_is_equal(t_product(NewArgTypes0), t_product(OldArgTypes0))}
     end,
   case Fixpoint of
     true -> State;
     false ->
-      NewArgTypes = [t_sup(X, Y) ||
-                      {X, Y} <- lists:zip(ArgTypes, OldArgTypes)],
       NewWork = add_work(Fun, Work),
       ?debug("~tw: forwarding args ~ts\n",
 	     [state__lookup_name(Fun, State),

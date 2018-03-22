@@ -1,7 +1,7 @@
 %%
 %% %CopyrightBegin%
 %%
-%% Copyright Ericsson AB 1996-2017. All Rights Reserved.
+%% Copyright Ericsson AB 1996-2018. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -31,7 +31,7 @@
 -export([localtime_to_universaltime/1]).
 -export([suspend_process/1]).
 -export([min/2, max/2]).
--export([dmonitor_node/3, dmonitor_p/2]).
+-export([dmonitor_node/3]).
 -export([delay_trap/2]).
 -export([set_cookie/2, get_cookie/0]).
 -export([nodes/0]).
@@ -122,7 +122,7 @@
 -export([delete_element/2]).
 -export([delete_module/1, demonitor/1, demonitor/2, display/1]).
 -export([display_nl/0, display_string/1, erase/0, erase/1]).
--export([error/1, error/2, exit/1, exit/2, external_size/1]).
+-export([error/1, error/2, exit/1, exit/2, exit_signal/2, external_size/1]).
 -export([external_size/2, finish_after_on_load/2, finish_loading/1, float/1]).
 -export([float_to_binary/1, float_to_binary/2,
 	 float_to_list/1, float_to_list/2, floor/1]).
@@ -786,6 +786,13 @@ exit(_Reason) ->
 exit(_Pid, _Reason) ->
     erlang:nif_error(undefined).
 
+%% exit_signal/2
+-spec erlang:exit_signal(Pid, Reason) -> true when
+      Pid :: pid() | port(),
+      Reason :: term().
+exit_signal(_Pid, _Reason) ->
+    erlang:nif_error(undefined).
+
 %% external_size/1
 -spec erlang:external_size(Term) -> non_neg_integer() when
       Term :: term().
@@ -1012,8 +1019,20 @@ group_leader() ->
 -spec group_leader(GroupLeader, Pid) -> true when
       GroupLeader :: pid(),
       Pid :: pid().
-group_leader(_GroupLeader, _Pid) ->
-    erlang:nif_error(undefined).
+group_leader(GroupLeader, Pid) ->
+    case case erts_internal:group_leader(GroupLeader, Pid) of
+             false ->
+                 Ref = erlang:make_ref(),
+                 erts_internal:group_leader(GroupLeader,
+                                            Pid,
+                                            Ref),
+                 receive {Ref, MsgRes} -> MsgRes end;
+             Res ->
+                 Res
+         end of
+        true -> true;
+        Error -> erlang:error(Error, [GroupLeader, Pid])
+    end.
 
 %% halt/0
 %% Shadowed by erl_bif_types: erlang:halt/0
@@ -2403,6 +2422,10 @@ subtract(_,_) ->
                                 OldDirtyCPUSchedulersOnline when
       DirtyCPUSchedulersOnline :: pos_integer(),
       OldDirtyCPUSchedulersOnline :: pos_integer();
+                        (erts_alloc, {Alloc, F, V}) -> ok | notsup when
+      Alloc :: atom(),
+      F :: atom(),
+      V :: integer();
                         (fullsweep_after, Number) -> OldNumber when
       Number :: non_neg_integer(),
       OldNumber :: non_neg_integer();
@@ -2454,7 +2477,7 @@ term_to_binary(_Term) ->
       Term :: term(),
       Options :: [compressed |
                   {compressed, Level :: 0..9} |
-                  {minor_version, Version :: 0..1} ].
+                  {minor_version, Version :: 0..2} ].
 term_to_binary(_Term, _Options) ->
     erlang:nif_error(undefined).
 
@@ -2559,9 +2582,9 @@ tuple_to_list(_Tuple) ->
       Settings :: [{Subsystem :: atom(),
                     [{Parameter :: atom(),
                       Value :: term()}]}];
-         (alloc_util_allocators) -> [Alloc] when
-      Alloc :: atom();
          ({allocator, Alloc}) -> [_] when %% More or less anything
+      Alloc :: atom();
+         (alloc_util_allocators) -> [Alloc] when
       Alloc :: atom();
          ({allocator_sizes, Alloc}) -> [_] when %% More or less anything
       Alloc :: atom();
@@ -2589,6 +2612,7 @@ tuple_to_list(_Tuple) ->
          (driver_version) -> string();
 	 (dynamic_trace) -> none | dtrace | systemtap;
          (dynamic_trace_probes) -> boolean();
+         (end_time) -> non_neg_integer();
          (elib_malloc) -> false;
          (eager_check_io) -> boolean();
          (ets_limit) -> pos_integer();
@@ -2616,6 +2640,7 @@ tuple_to_list(_Tuple) ->
          (otp_release) -> string();
          (os_monotonic_time_source) -> [{atom(),term()}];
          (os_system_time_source) -> [{atom(),term()}];
+         (port_parallelism) -> boolean();
          (port_count) -> non_neg_integer();
          (port_limit) -> pos_integer();
          (process_count) -> pos_integer();
@@ -2645,7 +2670,8 @@ tuple_to_list(_Tuple) ->
          (trace_control_word) -> non_neg_integer();
          (update_cpu_info) -> changed | unchanged;
          (version) -> string();
-         (wordsize | {wordsize, internal} | {wordsize, external}) -> 4 | 8.
+         (wordsize | {wordsize, internal} | {wordsize, external}) -> 4 | 8;
+         (overview) -> boolean().
 system_info(_Item) ->
     erlang:nif_error(undefined).
 
@@ -3272,13 +3298,6 @@ dmonitor_node(Node, Flag, Opts) ->
 	    dmonitor_node(Node,Flag,[])
     end.
 
--spec erlang:dmonitor_p('process', pid() | {atom(),atom()}) -> reference().
-dmonitor_p(process, ProcSpec) ->
-    %% Only called when auto-connect attempt failed early in VM
-    Ref = erlang:make_ref(),
-    erlang:self() ! {'DOWN', Ref, process, ProcSpec, noconnection},
-    Ref.
-
 %%
 %% Trap function used when modified timing has been enabled.
 %%
@@ -3730,14 +3749,13 @@ memory_is_supported() ->
 
 get_blocks_size([{blocks_size, Sz, _, _} | Rest], Acc) ->
     get_blocks_size(Rest, Acc+Sz);
-get_blocks_size([{_, _, _, _} | Rest], Acc) ->
-    get_blocks_size(Rest, Acc);
 get_blocks_size([{blocks_size, Sz} | Rest], Acc) ->
     get_blocks_size(Rest, Acc+Sz);
-get_blocks_size([{_, _} | Rest], Acc) ->
+get_blocks_size([_ | Rest], Acc) ->
     get_blocks_size(Rest, Acc);
 get_blocks_size([], Acc) ->
     Acc.
+
 
 blocks_size([{Carriers, SizeList} | Rest], Acc) when Carriers == mbcs;
 						     Carriers == mbcs_pool;

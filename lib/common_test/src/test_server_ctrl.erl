@@ -2301,7 +2301,7 @@ run_test_cases(TestSpec, Config, TimetrapData) ->
 %% test_server_io:print_buffered/1 to print the data. To help with this,
 %% two variables in the process dictionary are used:
 %% 'test_server_common_io_handler' and 'test_server_queued_io'. The values
-%% are set to as follwing:
+%% are set to as following:
 %%
 %%   Value	Meaning
 %%   -----     -------
@@ -5167,7 +5167,7 @@ display_info([Pid|T], R, M) ->
 			   Other
 		   end,
 	    Reds  = fetch(reductions, Info),
-	    LM = length(fetch(messages, Info)),
+	    LM = fetch(message_queue_len, Info),
 	    pformat(io_lib:format("~w", [Pid]),
 		    io_lib:format("~tw", [Call]),
 		    io_lib:format("~tw", [Curr]), Reds, LM),
@@ -5739,7 +5739,7 @@ uri_encode_comp([Char|Chars],Encoding) ->
     Reserved = sets:is_element(Char, reserved()),
     case (Char>127 andalso Encoding==latin1) orelse Reserved of
 	true ->
-	    [ $% | http_util:integer_to_hexlist(Char)] ++
+	    [ $% | integer_to_list(Char, 16)] ++
 		uri_encode_comp(Chars,Encoding);
 	false ->
 	    [Char | uri_encode_comp(Chars,Encoding)]

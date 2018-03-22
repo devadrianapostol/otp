@@ -85,8 +85,6 @@ format_error(Error) ->
 %%% Things currently not checked. XXX
 %%%
 %%% - Heap allocation for binaries.
-%%% - That put_tuple is followed by the correct number of
-%%%   put instructions.
 %%%
 
 %% validate(Module, [Function]) -> [] | [Error]
@@ -148,7 +146,8 @@ validate_0(Module, [{function,Name,Ar,Entry,Code}|Fs], Ft) ->
 	 hf=0,				%Available heap size for floats.
 	 fls=undefined,			%Floating point state.
 	 ct=[],				%List of hot catch/try labels
-	 setelem=false			%Previous instruction was setelement/3.
+         setelem=false,                 %Previous instruction was setelement/3.
+         puts_left=none                 %put/1 instructions left.
 	}).
 
 -type label()        :: integer().
@@ -340,11 +339,25 @@ valfun_1({put_list,A,B,Dst}, Vst0) ->
     Vst = eat_heap(2, Vst0),
     set_type_reg(cons, Dst, Vst);
 valfun_1({put_tuple,Sz,Dst}, Vst0) when is_integer(Sz) ->
+    Vst1 = eat_heap(1, Vst0),
+    Vst = set_type_reg(tuple_in_progress, Dst, Vst1),
+    #vst{current=St0} = Vst,
+    St = St0#st{puts_left={Sz,{Dst,{tuple,Sz}}}},
+    Vst#vst{current=St};
+valfun_1({put,Src}, Vst0) ->
+    assert_term(Src, Vst0),
     Vst = eat_heap(1, Vst0),
-    set_type_reg({tuple,Sz}, Dst, Vst);
-valfun_1({put,Src}, Vst) ->
-    assert_term(Src, Vst),
-    eat_heap(1, Vst);
+    #vst{current=St0} = Vst,
+    case St0 of
+        #st{puts_left=none} ->
+            error(not_building_a_tuple);
+        #st{puts_left={1,{Dst,Type}}} ->
+            St = St0#st{puts_left=none},
+            set_type_reg(Type, Dst, Vst#vst{current=St});
+        #st{puts_left={PutsLeft,Info}} when is_integer(PutsLeft) ->
+            St = St0#st{puts_left={PutsLeft-1,Info}},
+            Vst#vst{current=St}
+    end;
 %% Instructions for optimization of selective receives.
 valfun_1({recv_mark,{f,Fail}}, Vst) when is_integer(Fail) ->
     Vst;
@@ -524,15 +537,18 @@ valfun_4({bif,element,{f,Fail},[Pos,Tuple],Dst}, Vst0) ->
 valfun_4({bif,raise,{f,0},Src,_Dst}, Vst) ->
     validate_src(Src, Vst),
     kill_state(Vst);
+valfun_4(raw_raise=I, Vst) ->
+    call(I, 3, Vst);
 valfun_4({bif,Op,{f,Fail},Src,Dst}, Vst0) ->
     validate_src(Src, Vst0),
     Vst = branch_state(Fail, Vst0),
     Type = bif_type(Op, Src, Vst),
     set_type_reg(Type, Dst, Vst);
 valfun_4({gc_bif,Op,{f,Fail},Live,Src,Dst}, #vst{current=St0}=Vst0) ->
+    verify_live(Live, Vst0),
+    verify_y_init(Vst0),
     St = kill_heap_allocation(St0),
     Vst1 = Vst0#vst{current=St},
-    verify_live(Live, Vst1),
     Vst2 = branch_state(Fail, Vst1),
     Vst = prune_x_regs(Live, Vst2),
     validate_src(Src, Vst),
@@ -575,6 +591,12 @@ valfun_4({get_list,Src,D1,D2}, Vst0) ->
     assert_type(cons, Src, Vst0),
     Vst = set_type_reg(term, D1, Vst0),
     set_type_reg(term, D2, Vst);
+valfun_4({get_hd,Src,Dst}, Vst) ->
+    assert_type(cons, Src, Vst),
+    set_type_reg(term, Dst, Vst);
+valfun_4({get_tl,Src,Dst}, Vst) ->
+    assert_type(cons, Src, Vst),
+    set_type_reg(term, Dst, Vst);
 valfun_4({get_tuple_element,Src,I,Dst}, Vst) ->
     assert_type({tuple_element,I+1}, Src, Vst),
     set_type_reg(term, Dst, Vst);
@@ -686,6 +708,7 @@ valfun_4({bs_utf16_size,{f,Fail},A,Dst}, Vst) ->
     set_type_reg({integer,[]}, Dst, branch_state(Fail, Vst));
 valfun_4({bs_init2,{f,Fail},Sz,Heap,Live,_,Dst}, Vst0) ->
     verify_live(Live, Vst0),
+    verify_y_init(Vst0),
     if
 	is_integer(Sz) ->
 	    ok;
@@ -698,6 +721,7 @@ valfun_4({bs_init2,{f,Fail},Sz,Heap,Live,_,Dst}, Vst0) ->
     set_type_reg(binary, Dst, Vst);
 valfun_4({bs_init_bits,{f,Fail},Sz,Heap,Live,_,Dst}, Vst0) ->
     verify_live(Live, Vst0),
+    verify_y_init(Vst0),
     if
 	is_integer(Sz) ->
 	    ok;
@@ -710,6 +734,7 @@ valfun_4({bs_init_bits,{f,Fail},Sz,Heap,Live,_,Dst}, Vst0) ->
     set_type_reg(binary, Dst, Vst);
 valfun_4({bs_append,{f,Fail},Bits,Heap,Live,_Unit,Bin,_Flags,Dst}, Vst0) ->
     verify_live(Live, Vst0),
+    verify_y_init(Vst0),
     assert_term(Bits, Vst0),
     assert_term(Bin, Vst0),
     Vst1 = heap_alloc(Heap, Vst0),
@@ -945,6 +970,7 @@ deallocate(#vst{current=St}=Vst) ->
 
 test_heap(Heap, Live, Vst0) ->
     verify_live(Live, Vst0),
+    verify_y_init(Vst0),
     Vst = prune_x_regs(Live, Vst0),
     heap_alloc(Heap, Vst).
 
@@ -1127,6 +1153,7 @@ set_type_y(Type, {y,Y}=Reg, #vst{current=#st{y=Ys0}=St}=Vst)
 	     {value,_} ->
 		 gb_trees:update(Y, Type, Ys0)
 	 end,
+    check_try_catch_tags(Type, Y, Ys0),
     Vst#vst{current=St#st{y=Ys}};
 set_type_y(Type, Reg, #vst{}) -> error({invalid_store,Reg,Type}).
 
@@ -1134,6 +1161,29 @@ set_catch_end({y,Y}, #vst{current=#st{y=Ys0}=St}=Vst) ->
     Ys = gb_trees:update(Y, initialized, Ys0),
     Vst#vst{current=St#st{y=Ys}}.
 
+check_try_catch_tags(Type, LastY, Ys) ->
+    case is_try_catch_tag(Type) of
+        false ->
+            ok;
+        true ->
+            %% Every catch or try/catch must use a lower Y register
+            %% number than any enclosing catch or try/catch. That will
+            %% ensure that when the stack is scanned when an
+            %% exception occurs, the innermost try/catch tag is found
+            %% first.
+            Bad = [{{y,Y},Tag} || {Y,Tag} <- gb_trees:to_list(Ys),
+                                  Y < LastY, is_try_catch_tag(Tag)],
+            case Bad of
+                [] ->
+                    ok;
+                [_|_] ->
+                    error({bad_try_catch_nesting,{y,LastY},Bad})
+            end
+    end.
+
+is_try_catch_tag({catchtag,_}) -> true;
+is_try_catch_tag({trytag,_}) -> true;
+is_try_catch_tag(_) -> false.
 
 is_reg_defined({x,_}=Reg, Vst) -> is_type_defined_x(Reg, Vst);
 is_reg_defined({y,_}=Reg, Vst) -> is_type_defined_y(Reg, Vst);
@@ -1267,6 +1317,7 @@ get_move_term_type(Src, Vst) ->
 	initialized -> error({unassigned,Src});
 	{catchtag,_} -> error({catchtag,Src});
 	{trytag,_} -> error({trytag,Src});
+        tuple_in_progress -> error({tuple_in_progress,Src});
 	Type -> Type
     end.
 
@@ -1275,10 +1326,7 @@ get_move_term_type(Src, Vst) ->
 %%  a standard Erlang type (no catch/try tags or match contexts).
 
 get_term_type(Src, Vst) ->
-    case get_term_type_1(Src, Vst) of
-	initialized -> error({unassigned,Src});
-	{catchtag,_} -> error({catchtag,Src});
-	{trytag,_} -> error({trytag,Src});
+    case get_move_term_type(Src, Vst) of
 	#ms{} -> error({match_context,Src});
 	Type -> Type
     end.
@@ -1325,7 +1373,12 @@ branch_arities([Sz,{f,L}|T], Tuple, #vst{current=St}=Vst0)
     Vst = branch_state(L, Vst1),
     branch_arities(T, Tuple, Vst#vst{current=St}).
 
-branch_state(0, #vst{}=Vst) -> Vst;
+branch_state(0, #vst{}=Vst) ->
+    %% If the instruction fails, the stack may be scanned
+    %% looking for a catch tag. Therefore the Y registers
+    %% must be initialized at this point.
+    verify_y_init(Vst),
+    Vst;
 branch_state(L, #vst{current=St,branched=B}=Vst) ->
     Vst#vst{
       branched=case gb_trees:is_defined(L, B) of

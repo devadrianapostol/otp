@@ -120,6 +120,10 @@ handle_event(#wx{id=?REFRESH}, #state{frame=Frame, pid=Pid, pages=Pages, expand_
     end,
     {noreply, State};
 
+handle_event(#wx{obj=MoreEntry,event=#wxMouse{type=left_down},userData={more,More}}, State) ->
+    observer_lib:add_scroll_entries(MoreEntry,More),
+    {noreply, State};
+
 handle_event(#wx{event=#wxMouse{type=left_down}, userData=TargetPid}, State) ->
     observer ! {open_link, TargetPid},
     {noreply, State};
@@ -144,7 +148,7 @@ handle_event(#wx{event=#wxHtmlLink{linkInfo=#wxHtmlLinkInfo{href=Href}}},
 	    observer ! {open_link, Href},
 	    {noreply, State};
 	Callback ->
-	    [{"key1",Key1},{"key2",Key2},{"key3",Key3}] = httpd:parse_query(Rest),
+	    [{"key1",Key1},{"key2",Key2},{"key3",Key3}] = uri_string:dissect_query(Rest),
 	    Id = {obs, {T,{list_to_integer(Key1),
 			   list_to_integer(Key2),
 			   list_to_integer(Key3)}}},
@@ -253,8 +257,6 @@ init_stack_page(Parent, Pid) ->
 					      [Pid, current_stacktrace])
 		     of
 			 {current_stacktrace,RawBt} ->
-			     observer_wx:try_rpc(node(Pid), erlang, process_info,
-						 [Pid, current_stacktrace]),
 			     wxListCtrl:deleteAllItems(LCtrl),
 			     wx:foldl(fun({M, F, A, Info}, Row) ->
 					      _Item = wxListCtrl:insertItem(LCtrl, Row, ""),

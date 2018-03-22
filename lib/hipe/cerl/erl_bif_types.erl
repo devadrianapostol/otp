@@ -585,6 +585,13 @@ type(erlang, float, 1, Xs, Opaques) ->
 %% Guard bif, needs to be here.
 type(erlang, floor, 1, Xs, Opaques) ->
   strict(erlang, floor, 1, Xs, fun (_) -> t_integer() end, Opaques);
+%% Primop, needs to be somewhere.
+type(erlang, build_stacktrace, 0, _, _Opaques) ->
+  t_list(t_tuple([t_module(),
+                  t_atom(),
+                  t_sup([t_arity(),t_list()]),
+                  t_list(t_sup([t_tuple([t_atom('file'),t_string()]),
+                                t_tuple([t_atom('line'),t_pos_integer()])]))]));
 %% Guard bif, needs to be here.
 type(erlang, hd, 1, Xs, Opaques) ->
   strict(erlang, hd, 1, Xs, fun ([X]) -> t_cons_hd(X) end, Opaques);
@@ -1885,7 +1892,8 @@ infinity_div(Number1, Number2) when is_integer(Number1), is_integer(Number2) ->
 
 infinity_bsl(pos_inf, _) -> pos_inf;
 infinity_bsl(neg_inf, _) -> neg_inf;
-infinity_bsl(Number, pos_inf) when is_integer(Number), Number >= 0 -> pos_inf;
+infinity_bsl(0, pos_inf) -> 0;
+infinity_bsl(Number, pos_inf) when is_integer(Number), Number > 0 -> pos_inf;
 infinity_bsl(Number, pos_inf) when is_integer(Number) -> neg_inf;
 infinity_bsl(Number, neg_inf) when is_integer(Number), Number >= 0 -> 0;
 infinity_bsl(Number, neg_inf) when is_integer(Number) -> -1;
@@ -1974,9 +1982,11 @@ arith_abs(X1, Opaques) ->
         case infinity_geq(Min1, 0) of
           true -> {Min1, Max1};
           false ->
+            NegMin1 = infinity_inv(Min1),
+            NegMax1 = infinity_inv(Max1),
             case infinity_geq(Max1, 0) of
-              true  -> {0, infinity_inv(Min1)};
-              false -> {infinity_inv(Max1), infinity_inv(Min1)}
+              true  -> {0, max(NegMin1, Max1)};
+              false -> {NegMax1, NegMin1}
             end
         end,
       t_from_range(NewMin, NewMax)
@@ -2333,6 +2343,9 @@ arg_types(erlang, float, 1) ->
 %% Guard bif, needs to be here.
 arg_types(erlang, floor, 1) ->
   [t_number()];
+%% Primop, needs to be somewhere.
+arg_types(erlang, build_stacktrace, 0) ->
+  [];
 %% Guard bif, needs to be here.
 arg_types(erlang, hd, 1) ->
   [t_cons()];

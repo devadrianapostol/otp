@@ -78,6 +78,7 @@
 -export([ets_all/1]).
 -export([massive_ets_all/1]).
 -export([take/1]).
+-export([whereis_table/1]).
 
 -export([init_per_testcase/2, end_per_testcase/2]).
 %% Convenience for manual testing
@@ -137,7 +138,8 @@ all() ->
      otp_9423,
      ets_all,
      massive_ets_all,
-     take].
+     take,
+     whereis_table].
 
 groups() ->
     [{new, [],
@@ -3647,7 +3649,7 @@ verify_rescheduling_exit(Config, ForEachData, Flags, Fix, NOTabs, NOProcs) ->
 			  XScheds = count_exit_sched(TP),
 			  io:format("~p XScheds=~p~n",
 				    [TP, XScheds]),
-			  true = XScheds >= 5
+			  true = XScheds >= 3
 		  end,
 		  TPs),
     stop_loopers(LPs),
@@ -4099,6 +4101,7 @@ info_do(Opts) ->
     {value, {keypos, 2}} = lists:keysearch(keypos, 1, Res),
     {value, {protection, protected}} =
 	lists:keysearch(protection, 1, Res),
+    {value, {id, Tab}} = lists:keysearch(id, 1, Res),
     true = ets:delete(Tab),
     undefined = ets:info(non_existing_table_xxyy),
     undefined = ets:info(non_existing_table_xxyy,type),
@@ -5892,6 +5895,36 @@ take(Config) when is_list(Config) ->
     ets:delete(T3),
     ok.
 
+whereis_table(Config) when is_list(Config) ->
+    %% Do we return 'undefined' when the named table doesn't exist?
+    undefined = ets:whereis(whereis_test),
+
+    %% Does the tid() refer to the same table as the name?
+    whereis_test = ets:new(whereis_test, [named_table]),
+    Tid = ets:whereis(whereis_test),
+
+    ets:insert(whereis_test, [{hello}, {there}]),
+
+    [[{hello}],[{there}]] = ets:match(whereis_test, '$1'),
+    [[{hello}],[{there}]] = ets:match(Tid, '$1'),
+
+    true = ets:delete_all_objects(Tid),
+
+    [] = ets:match(whereis_test, '$1'),
+    [] = ets:match(Tid, '$1'),
+
+    %% Does the name disappear when deleted through the tid()?
+    true = ets:delete(Tid),
+    undefined = ets:info(whereis_test),
+    {'EXIT',{badarg, _}} = (catch ets:match(whereis_test, '$1')),
+
+    %% Is the old tid() broken when the table is re-created with the same
+    %% name?
+    whereis_test = ets:new(whereis_test, [named_table]),
+    [] = ets:match(whereis_test, '$1'),
+    {'EXIT',{badarg, _}} = (catch ets:match(Tid, '$1')),
+
+    ok.
 
 %%
 %% Utility functions:
@@ -6023,17 +6056,23 @@ etsmem() ->
 	 end},
     {Mem,AllTabs}.
 
-verify_etsmem({MemInfo,AllTabs}) ->
+
+verify_etsmem(MI) ->
     wait_for_test_procs(),
+    verify_etsmem(MI, 1).
+
+verify_etsmem({MemInfo,AllTabs}, Try) ->
     case etsmem() of
 	{MemInfo,_} ->
 	    io:format("Ets mem info: ~p", [MemInfo]),
-	    case MemInfo of
-		{ErlMem,EtsAlloc} when ErlMem == notsup; EtsAlloc == undefined ->
+	    case {MemInfo, Try} of
+		{{ErlMem,EtsAlloc},_} when ErlMem == notsup; EtsAlloc == undefined ->
 		    %% Use 'erl +Mea max' to do more complete memory leak testing.
 		    {comment,"Incomplete or no mem leak testing"};
-		_ ->
-                    ok
+		{_, 1} ->
+                    ok;
+                _ ->
+                    {comment, "Transient memory discrepancy"}
 	    end;
 
 	{MemInfo2, AllTabs2} ->
@@ -6041,7 +6080,15 @@ verify_etsmem({MemInfo,AllTabs}) ->
 	    io:format("Actual:   ~p", [MemInfo2]),
 	    io:format("Changed tables before: ~p\n",[AllTabs -- AllTabs2]),
 	    io:format("Changed tables after: ~p\n", [AllTabs2 -- AllTabs]),
-            ct:fail("Failed memory check")
+            case Try < 2 of
+                true ->
+                    io:format("\nThis discrepancy could be caused by an "
+                              "inconsistent memory \"snapshot\""
+                              "\nTry again...\n", []),
+                    verify_etsmem({MemInfo, AllTabs}, Try+1);
+                false ->
+                    ct:fail("Failed memory check")
+            end
     end.
 
 

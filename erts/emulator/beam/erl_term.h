@@ -1,7 +1,7 @@
 /*
  * %CopyrightBegin%
  *
- * Copyright Ericsson AB 2000-2017. All Rights Reserved.
+ * Copyright Ericsson AB 2000-2018. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -313,7 +313,8 @@ _ET_DECLARE_CHECKED(Uint,header_arity,Eterm)
 #define MAX_ARITYVAL            ((((Uint)1) << 24) - 1)
 #define ERTS_MAX_TUPLE_SIZE     MAX_ARITYVAL
 
-#define make_arityval(sz)	_make_header((sz),_TAG_HEADER_ARITYVAL)
+#define make_arityval(sz)	(ASSERT((sz) <= MAX_ARITYVAL), \
+                                 _make_header((sz),_TAG_HEADER_ARITYVAL))
 #define is_arity_value(x)	(((x) & _TAG_HEADER_MASK) == _TAG_HEADER_ARITYVAL)
 #define is_sane_arity_value(x)	((((x) & _TAG_HEADER_MASK) == _TAG_HEADER_ARITYVAL) && \
 				 (((x) >> _HEADER_ARITY_OFFS) <= MAX_ARITYVAL))
@@ -344,6 +345,9 @@ _ET_DECLARE_CHECKED(Uint,thing_subtag,Eterm)
  *
  * To help find code which makes unwarranted assumptions about zero,
  * we now use a non-zero bit-pattern in debug mode.
+ *
+ * In order to be able to differentiata against values, the non-value
+ * needs to be tagged as a header of some sort.
  */
 #if ET_DEBUG
 # ifdef HIPE
@@ -354,7 +358,7 @@ _ET_DECLARE_CHECKED(Uint,thing_subtag,Eterm)
 #  define THE_NON_VALUE	_make_header(0,_TAG_HEADER_FLOAT)
 # endif
 #else
-#define THE_NON_VALUE	(0)
+#define THE_NON_VALUE	(TAG_PRIMARY_HEADER)
 #endif
 #define is_non_value(x)	((x) == THE_NON_VALUE)
 #define is_value(x)	((x) != THE_NON_VALUE)

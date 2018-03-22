@@ -45,6 +45,8 @@ all() ->
      {group, openssh},
      small_interrupted_send,
      interrupted_send,
+     exec_erlang_term,
+     exec_erlang_term_non_default_shell,
      start_shell,
      start_shell_exec,
      start_shell_exec_fun,
@@ -85,6 +87,7 @@ init_per_suite(Config) ->
     ?CHECK_CRYPTO(Config).
 
 end_per_suite(Config) ->
+    catch ssh:stop(),
     Config.
 
 %%--------------------------------------------------------------------
@@ -542,6 +545,79 @@ start_shell_exec(Config) when is_list(Config) ->
     ssh:stop_daemon(Pid).
 
 %%--------------------------------------------------------------------
+exec_erlang_term(Config) when is_list(Config) ->
+    PrivDir = proplists:get_value(priv_dir, Config),
+    UserDir = filename:join(PrivDir, nopubkey), % to make sure we don't use public-key-auth
+    file:make_dir(UserDir),
+    SysDir = proplists:get_value(data_dir, Config),
+    {Pid, Host, Port} = ssh_test_lib:daemon([{system_dir, SysDir},
+					     {user_dir, UserDir},
+					     {password, "morot"}
+                                            ]),
+
+    ConnectionRef = ssh_test_lib:connect(Host, Port, [{silently_accept_hosts, true},
+						      {user, "foo"},
+						      {password, "morot"},
+						      {user_interaction, true},
+						      {user_dir, UserDir}]),
+
+    {ok, ChannelId0} = ssh_connection:session_channel(ConnectionRef, infinity),
+
+    success = ssh_connection:exec(ConnectionRef, ChannelId0,
+				  "1+2.", infinity),
+    TestResult =
+        receive
+            {ssh_cm, ConnectionRef, {data, _ChannelId, 0, <<"3",_/binary>>}} = R ->
+                ct:log("Got expected ~p",[R]);
+            Other ->
+                ct:log("Got unexpected ~p",[Other])
+        after 5000 ->
+                {fail,"Exec Timeout"}
+        end,
+
+    ssh:close(ConnectionRef),
+    ssh:stop_daemon(Pid),
+    TestResult.
+
+%%--------------------------------------------------------------------
+exec_erlang_term_non_default_shell(Config) when is_list(Config) ->
+    PrivDir = proplists:get_value(priv_dir, Config),
+    UserDir = filename:join(PrivDir, nopubkey), % to make sure we don't use public-key-auth
+    file:make_dir(UserDir),
+    SysDir = proplists:get_value(data_dir, Config),
+    {Pid, Host, Port} = ssh_test_lib:daemon([{system_dir, SysDir},
+					     {user_dir, UserDir},
+					     {password, "morot"},
+                                             {shell, fun(U, H) -> start_our_shell(U, H) end}
+                                            ]),
+
+    ConnectionRef = ssh_test_lib:connect(Host, Port, [{silently_accept_hosts, true},
+						      {user, "foo"},
+						      {password, "morot"},
+						      {user_interaction, true},
+						      {user_dir, UserDir}
+                                                     ]),
+
+    {ok, ChannelId0} = ssh_connection:session_channel(ConnectionRef, infinity),
+
+    success = ssh_connection:exec(ConnectionRef, ChannelId0,
+				  "1+2.", infinity),
+    TestResult =
+        receive
+            {ssh_cm, ConnectionRef, {data, _ChannelId, 0, <<"3",_/binary>>}} = R ->
+                ct:log("Got unexpected ~p",[R]),
+                {fail,"Could exec erlang term although non-erlang shell"};
+            Other ->
+                ct:log("Got expected ~p",[Other])
+        after 5000 ->
+                {fail, "Exec Timeout"}
+        end,
+
+    ssh:close(ConnectionRef),
+    ssh:stop_daemon(Pid),
+    TestResult.
+
+%%--------------------------------------------------------------------
 start_shell_exec_fun() ->
     [{doc, "start shell to exec command"}].
 
@@ -800,6 +876,8 @@ stop_listener(Config) when is_list(Config) ->
 	    ssh:stop_daemon(Pid0),
 	    ssh:stop_daemon(Pid1);
 	Error ->
+	    ssh:close(ConnectionRef0),
+	    ssh:stop_daemon(Pid0),
 	    ct:fail({unexpected, Error})
     end.
 
@@ -819,11 +897,22 @@ start_subsystem_on_closed_channel(Config) ->
 						      {user_interaction, false},
 						      {user_dir, UserDir}]),
 
-    {ok, ChannelId} = ssh_connection:session_channel(ConnectionRef, infinity),
 
-    ok = ssh_connection:close(ConnectionRef, ChannelId),
+    {ok, ChannelId1} = ssh_connection:session_channel(ConnectionRef, infinity),
+    ok = ssh_connection:close(ConnectionRef, ChannelId1),
+    {error, closed} = ssh_connection:ptty_alloc(ConnectionRef, ChannelId1, []),
+    {error, closed} = ssh_connection:subsystem(ConnectionRef, ChannelId1, "echo_n", 5000),
+    {error, closed} = ssh_connection:exec(ConnectionRef, ChannelId1, "testing1.\n", 5000),
+    {error, closed} = ssh_connection:send(ConnectionRef, ChannelId1, "exit().\n", 5000),
 
-    {error, closed} = ssh_connection:subsystem(ConnectionRef, ChannelId, "echo_n", infinity),
+    %% Test that there could be a gap between close and an operation (Bugfix OTP-14939):
+    {ok, ChannelId2} = ssh_connection:session_channel(ConnectionRef, infinity),
+    ok = ssh_connection:close(ConnectionRef, ChannelId2),
+    timer:sleep(2000),
+    {error, closed} = ssh_connection:ptty_alloc(ConnectionRef, ChannelId2, []),
+    {error, closed} = ssh_connection:subsystem(ConnectionRef, ChannelId2, "echo_n", 5000),
+    {error, closed} = ssh_connection:exec(ConnectionRef, ChannelId2, "testing1.\n", 5000),
+    {error, closed} = ssh_connection:send(ConnectionRef, ChannelId2, "exit().\n", 5000),
 
     ssh:close(ConnectionRef),
     ssh:stop_daemon(Pid).

@@ -1,7 +1,7 @@
 %%
 %% %CopyrightBegin%
 %%
-%% Copyright Ericsson AB 1997-2017. All Rights Reserved.
+%% Copyright Ericsson AB 1997-2018. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -40,7 +40,8 @@
 	 lookup_bad_search_option/1,
 	 getif/1,
 	 getif_ifr_name_overflow/1,getservbyname_overflow/1, getifaddrs/1,
-	 parse_strict_address/1, simple_netns/1, simple_netns_open/1,
+	 parse_strict_address/1, ipv4_mapped_ipv6_address/1,
+         simple_netns/1, simple_netns_open/1,
          simple_bind_to_device/1, simple_bind_to_device_open/1]).
 
 -export([get_hosts/1, get_ipv6_hosts/1, parse_hosts/1, parse_address/1,
@@ -667,6 +668,26 @@ parse_strict_address(Config) when is_list(Config) ->
     {ok, {3089,3106,23603,50240,0,0,119,136}} =
 	inet:parse_strict_address("c11:0c22:5c33:c440::077:0088").
 
+ipv4_mapped_ipv6_address(Config) when is_list(Config) ->
+    {D1,D2,D3,D4} = IPv4Address =
+        {rand:uniform(256) - 1,
+         rand:uniform(256) - 1,
+         rand:uniform(256) - 1,
+         rand:uniform(256) - 1},
+    E7 = (D1 bsl 8) bor D2,
+    E8 = (D3 bsl 8) bor D4,
+    io:format("IPv4Address: ~p.~n", [IPv4Address]),
+    {0,0,0,0,0,65535,E7,E8} = inet:ipv4_mapped_ipv6_address(IPv4Address),
+    IPv6Address =
+        {rand:uniform(65536) - 1,
+         rand:uniform(65536) - 1,
+         rand:uniform(65536) - 1,
+         rand:uniform(65536) - 1,
+         rand:uniform(65536) - 1,
+         rand:uniform(65536) - 1, E7, E8},
+    IPv4Address = inet:ipv4_mapped_ipv6_address(IPv6Address),
+    ok.
+
 t_gethostnative(Config) when is_list(Config) ->
     %% this will result in 26 bytes sent which causes problem in Windows
     %% if the port-program has not assured stdin to be read in BINARY mode
@@ -1083,11 +1104,9 @@ ifaddrs([{If,Opts}|IOs]) ->
     #ifopts{flags=F} = Ifopts = check_ifopts(Opts, #ifopts{name=If}),
     case F of
 	{flags,Flags} ->
-	    case lists:member(up, Flags) of
-		true ->
-		  Ifopts#ifopts.addrs;
-		false ->
-		    []
+	    case lists:member(running, Flags) of
+		true -> Ifopts#ifopts.addrs;
+		false -> []
 	    end ++ ifaddrs(IOs);
 	undefined ->
 	    ifaddrs(IOs)

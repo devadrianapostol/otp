@@ -407,7 +407,17 @@ encode_arg({atom, Atom}, Dict0) when is_atom(Atom) ->
     {Index, Dict} = beam_dict:atom(Atom, Dict0),
     {encode(?tag_a, Index), Dict};
 encode_arg({integer, N}, Dict) ->
-    {encode(?tag_i, N), Dict};
+    %% Conservatily assume that all integers whose absolute
+    %% value is greater than 1 bsl 128 will be bignums in
+    %% the runtime system.
+    if
+        N >= 1 bsl 128 ->
+            encode_arg({literal, N}, Dict);
+        N =< -(1 bsl 128) ->
+            encode_arg({literal, N}, Dict);
+        true ->
+            {encode(?tag_i, N), Dict}
+    end;
 encode_arg(nil, Dict) ->
     {encode(?tag_a, 0), Dict};
 encode_arg({f, W}, Dict) ->
@@ -465,7 +475,7 @@ encode_alloc_list_1([{floats,Floats}|T], Dict, Acc0) ->
 encode_alloc_list_1([], Dict, Acc) ->
     {iolist_to_binary(Acc),Dict}.
 
--spec encode(non_neg_integer(), pos_integer()) -> iodata().
+-spec encode(non_neg_integer(), integer()) -> iodata().
 
 encode(Tag, N) when N < 0 ->
     encode1(Tag, negative_to_bytes(N));

@@ -56,7 +56,8 @@
 	  open1/1,
 	  old_modes/1, new_modes/1, path_open/1, open_errors/1]).
 -export([ file_info_basic_file/1, file_info_basic_directory/1,
-	  file_info_bad/1, file_info_times/1, file_write_file_info/1]).
+	  file_info_bad/1, file_info_times/1, file_write_file_info/1,
+          file_wfi_helpers/1]).
 -export([rename/1, access/1, truncate/1, datasync/1, sync/1,
 	 read_write/1, pread_write/1, append/1, exclusive/1]).
 -export([ e_delete/1, e_rename/1, e_make_dir/1, e_del_dir/1]).
@@ -152,7 +153,8 @@ groups() ->
      {pos, [], [pos1, pos2, pos3]},
      {file_info, [],
       [file_info_basic_file, file_info_basic_directory,
-       file_info_bad, file_info_times, file_write_file_info]},
+       file_info_bad, file_info_times, file_write_file_info,
+       file_wfi_helpers]},
      {consult, [], [consult1, path_consult]},
      {eval, [], [eval1, path_eval]},
      {script, [], [script1, path_script]},
@@ -399,11 +401,11 @@ read_write_0(Str, {Func, ReadFun}, Options) ->
 	    io:format("~p:~p: ~p ERROR: ~ts vs~n             ~w~n  - ~p~n",
 		      [?MODULE, Line, Func, Str, ReadBytes, Options]),
 	    exit({error, ?LINE});
-	  error:What ->
+	  error:What:Stacktrace ->
 	    io:format("~p:??: ~p ERROR: ~p from~n  ~w~n  ~p~n",
 		      [?MODULE, Func, What, Str, Options]),
 
-	    io:format("\t~p~n", [erlang:get_stacktrace()]),
+	    io:format("\t~p~n", [Stacktrace]),
 	    exit({error, ?LINE})
     end.
 
@@ -1608,6 +1610,39 @@ file_write_file_info(Config) when is_list(Config) ->
     [] = flush(),
     ok.
 
+file_wfi_helpers(Config) when is_list(Config) ->
+    RootDir = get_good_directory(Config),
+    io:format("RootDir = ~p", [RootDir]),
+
+    Name = filename:join(RootDir,
+                         atom_to_list(?MODULE) ++ "_wfi_helpers"),
+
+    ok = ?FILE_MODULE:write_file(Name, "hello again"),
+    NewTime = {{1997, 02, 15}, {13, 18, 20}},
+    ok = ?FILE_MODULE:change_time(Name, NewTime, NewTime),
+
+    {ok, #file_info{atime=NewActAtime, mtime=NewTime}} =
+        ?FILE_MODULE:read_file_info(Name),
+
+    NewFilteredAtime = filter_atime(NewTime, Config),
+    NewFilteredAtime = filter_atime(NewActAtime, Config),
+
+    %% Make the file unwritable
+    ok = ?FILE_MODULE:change_mode(Name, 8#400),
+    {error, eacces} = ?FILE_MODULE:write_file(Name, "hello again"),
+
+    %% ... and writable again
+    ok = ?FILE_MODULE:change_mode(Name, 8#600),
+    ok = ?FILE_MODULE:write_file(Name, "hello again"),
+
+    %% We have no idea which users will work, so all we can do is to check
+    %% that it returns enoent instead of crashing.
+    {error, enoent} = ?FILE_MODULE:change_group("bogus file name", 0),
+    {error, enoent} = ?FILE_MODULE:change_owner("bogus file name", 0),
+
+    [] = flush(),
+    ok.
+
 %% Returns a directory on a file system that has correct file times.
 
 get_good_directory(Config) ->
@@ -2177,7 +2212,7 @@ e_delete(Config) when is_list(Config) ->
 	       Base, #file_info {mode=0}),
 	    {error, eacces} = ?FILE_MODULE:delete(Afile),
 	    ?FILE_MODULE:write_file_info(
-	       Base, #file_info {mode=8#600})
+	       Base, #file_info {mode=8#700})
     end,
 
     [] = flush(),
@@ -2308,7 +2343,7 @@ e_make_dir(Config) when is_list(Config) ->
 	    ?FILE_MODULE:write_file_info(Base, #file_info {mode=0}),
 	    {error, eacces} = ?FILE_MODULE:make_dir(filename:join(Base, "xxxx")),
 	    ?FILE_MODULE:write_file_info(
-	       Base, #file_info {mode=8#600})
+	       Base, #file_info {mode=8#700})
     end,
     ok.
 
@@ -2354,7 +2389,7 @@ e_del_dir(Config) when is_list(Config) ->
 	    ok = ?FILE_MODULE:make_dir(ADirectory),
 	    ?FILE_MODULE:write_file_info( Base, #file_info {mode=0}),
 	    {error, eacces} = ?FILE_MODULE:del_dir(ADirectory),
-	    ?FILE_MODULE:write_file_info( Base, #file_info {mode=8#600})
+	    ?FILE_MODULE:write_file_info( Base, #file_info {mode=8#700})
     end,
     [] = flush(),
     ok.

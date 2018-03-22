@@ -2533,7 +2533,7 @@ load_tracer_nif(const ErtsTracer tracer)
 
     for(i = 0; i < num_of_funcs; i++) {
         for (j = 0; j < NIF_TRACER_TYPES; j++) {
-            if (strcmp(tracers[j].name, funcs[i].name) == 0 && tracers[j].arity == funcs[i].arity) {
+            if (sys_strcmp(tracers[j].name, funcs[i].name) == 0 && tracers[j].arity == funcs[i].arity) {
                 tracers[j].cb = &(funcs[i]);
                 break;
             }
@@ -2783,24 +2783,28 @@ is_tracer_enabled(Process* c_p, ErtsProcLocks c_p_locks,
         ASSERT(0);
     }
 
-    /* Only remove tracer on self() and ports */
+    /* Only remove tracer on (self() or ports) AND we are on a normal scheduler */
     if (is_internal_port(t_p->id) || (c_p && c_p->common.id == t_p->id)) {
+        ErtsSchedulerData *esdp = erts_get_scheduler_data();
         ErtsProcLocks c_p_xlocks = 0;
-        if (is_internal_pid(t_p->id)) {
-            ERTS_LC_ASSERT(erts_proc_lc_my_proc_locks(c_p) & ERTS_PROC_LOCK_MAIN);
-            if (c_p_locks != ERTS_PROC_LOCKS_ALL) {
-                c_p_xlocks = ~c_p_locks & ERTS_PROC_LOCKS_ALL;
-                if (erts_proc_trylock(c_p, c_p_xlocks) == EBUSY) {
-                    erts_proc_unlock(c_p, c_p_locks & ~ERTS_PROC_LOCK_MAIN);
-                    erts_proc_lock(c_p, ERTS_PROC_LOCKS_ALL_MINOR);
+        if (esdp && !ERTS_SCHEDULER_IS_DIRTY(esdp)) {
+            if (is_internal_pid(t_p->id)) {
+                ERTS_LC_ASSERT(erts_proc_lc_my_proc_locks(c_p) & ERTS_PROC_LOCK_MAIN);
+                if (c_p_locks != ERTS_PROC_LOCKS_ALL) {
+                    c_p_xlocks = ~c_p_locks & ERTS_PROC_LOCKS_ALL;
+                    if (erts_proc_trylock(c_p, c_p_xlocks) == EBUSY) {
+                        erts_proc_unlock(c_p, c_p_locks & ~ERTS_PROC_LOCK_MAIN);
+                        erts_proc_lock(c_p, ERTS_PROC_LOCKS_ALL_MINOR);
+                    }
                 }
             }
-        }
-        erts_tracer_replace(t_p, erts_tracer_nil);
-        t_p->trace_flags &= ~TRACEE_FLAGS;
 
-        if (c_p_xlocks)
-            erts_proc_unlock(c_p, c_p_xlocks);
+            erts_tracer_replace(t_p, erts_tracer_nil);
+            t_p->trace_flags &= ~TRACEE_FLAGS;
+
+            if (c_p_xlocks)
+                erts_proc_unlock(c_p, c_p_xlocks);
+        }
     }
 
     return 0;
@@ -3015,7 +3019,7 @@ static void *tracer_alloc_fun(void* tmpl)
     ErtsTracerNif *obj = erts_alloc(ERTS_ALC_T_TRACER_NIF,
                                     sizeof(ErtsTracerNif) +
                                     sizeof(ErtsThrPrgrLaterOp));
-    memcpy(obj, tmpl, sizeof(*obj));
+    sys_memcpy(obj, tmpl, sizeof(*obj));
     return obj;
 }
 

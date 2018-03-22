@@ -1,7 +1,7 @@
 /*
  * %CopyrightBegin%
  *
- * Copyright Ericsson AB 2009-2017. All Rights Reserved.
+ * Copyright Ericsson AB 2009-2018. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -57,6 +57,7 @@
 #include "erl_bif_unique.h"
 #include "erl_utils.h"
 #include "erl_io_queue.h"
+#include "erl_proc_sig_queue.h"
 #undef ERTS_WANT_NFUNC_SCHED_INTERNALS__
 #define ERTS_WANT_NFUNC_SCHED_INTERNALS__
 #include "erl_nfunc_sched.h"
@@ -237,9 +238,11 @@ static void cache_env(ErlNifEnv* env);
 static void full_flush_env(ErlNifEnv *env);
 static void flush_env(ErlNifEnv* env);
 
-/* Temporary object header, auto-deallocated when NIF returns
- * or when independent environment is cleared.
- */
+/* Temporary object header, auto-deallocated when NIF returns or when
+ * independent environment is cleared.
+ *
+ * The payload can be accessed with &tmp_obj_ptr[1] but keep in mind that its
+ * first element must not require greater alignment than `next`. */
 struct enif_tmp_obj_t {
     struct enif_tmp_obj_t* next;
     void (*dtor)(struct enif_tmp_obj_t*);
@@ -254,6 +257,46 @@ static ERTS_INLINE void free_tmp_objs(ErlNifEnv* env)
 	env->tmp_obj_list = free_me->next;
 	free_me->dtor(free_me);
     }
+}
+
+/* Whether the given environment is bound to a process and will be cleaned up
+ * when the NIF returns. It's safe to use temp_alloc for objects in
+ * env->tmp_obj_list when this is true. */
+static ERTS_INLINE int is_proc_bound(ErlNifEnv *env)
+{
+    return env->mod_nif != NULL;
+}
+
+/* Allocates and attaches an object to the given environment, running its
+ * destructor when the environment is cleared. To avoid temporary variables the
+ * address of the allocated object is returned instead of the enif_tmp_obj_t.
+ *
+ * The destructor *must* call `erts_free(tmp_obj->allocator, tmp_obj)` to free
+ * the object. If the destructor needs to refer to the allocated object its
+ * address will be &tmp_obj[1]. */
+static ERTS_INLINE void *alloc_tmp_obj(ErlNifEnv *env, size_t size,
+                                       void (*dtor)(struct enif_tmp_obj_t*)) {
+    struct enif_tmp_obj_t *tmp_obj;
+    ErtsAlcType_t allocator;
+
+    allocator = is_proc_bound(env) ? ERTS_ALC_T_TMP : ERTS_ALC_T_NIF;
+
+    tmp_obj = erts_alloc(allocator, sizeof(struct enif_tmp_obj_t) + MAX(1, size));
+
+    tmp_obj->next = env->tmp_obj_list;
+    tmp_obj->allocator = allocator;
+    tmp_obj->dtor = dtor;
+
+    env->tmp_obj_list = tmp_obj;
+
+    return (void*)&tmp_obj[1];
+}
+
+/* Generic destructor for objects allocated through alloc_tmp_obj that don't
+ * care about their payload. */
+static void tmp_alloc_dtor(struct enif_tmp_obj_t *tmp_obj)
+{
+    erts_free(tmp_obj->allocator, tmp_obj);
 }
 
 void erts_post_nif(ErlNifEnv* env)
@@ -446,6 +489,7 @@ static void cache_env(ErlNifEnv* env)
 	env->hp_end = env->heap_frag->mem + env->heap_frag->alloc_size;
     }
 }
+
 void* enif_priv_data(ErlNifEnv* env)
 {
     return env->mod_nif->priv_data;
@@ -486,7 +530,7 @@ setup_nif_env(struct enif_msg_environment_t* msg_env,
     msg_env->env.tmp_obj_list = NULL;
     msg_env->env.proc = &msg_env->phony_proc;
     msg_env->env.exception_thrown = 0;
-    memset(&msg_env->phony_proc, 0, sizeof(Process));
+    sys_memset(&msg_env->phony_proc, 0, sizeof(Process));
     HEAP_START(&msg_env->phony_proc) = phony_heap;
     HEAP_TOP(&msg_env->phony_proc) = phony_heap;
     HEAP_LIMIT(&msg_env->phony_proc) = phony_heap;
@@ -615,7 +659,7 @@ int erts_flush_trace_messages(Process *c_p, ErtsProcLocks c_p_locks)
             rp_locks = 0;
             if (rp->common.id == c_p->common.id)
                 rp_locks = c_p_locks;
-            erts_queue_messages(rp, rp_locks, first, last, len, c_p->common.id);
+            erts_queue_messages(rp, rp_locks, first, last, len);
             if (rp->common.id == c_p->common.id)
                 rp_locks &= ~c_p_locks;
             if (rp_locks)
@@ -657,6 +701,7 @@ int enif_send(ErlNifEnv* env, const ErlNifPid* to_pid,
     Process* rp;
     Process* c_p;
     ErtsMessage *mp;
+    Eterm from;
     Eterm receiver = to_pid->pid;
     int scheduler;
 
@@ -735,7 +780,7 @@ int enif_send(ErlNifEnv* env, const ErlNifPid* to_pid,
         msg = copy_struct_litopt(msg, sz, &hp, ohp, &litarea);
     }
 
-    ERL_MESSAGE_TERM(mp) = msg;
+    from = c_p ? c_p->common.id : am_undefined;
 
     if (!env || !env->tracee) {
 
@@ -753,7 +798,6 @@ int enif_send(ErlNifEnv* env, const ErlNifPid* to_pid,
            tracee */
         ErlTraceMessageQueue *msgq;
         Process *t_p = env->tracee;
-
 
         erts_proc_lock(t_p, ERTS_PROC_LOCK_TRACE);
 
@@ -773,6 +817,9 @@ int enif_send(ErlNifEnv* env, const ErlNifPid* to_pid,
         if (ERTS_FORCE_ENIF_SEND_DELAY() || msgq ||
             rp_locks & ERTS_PROC_LOCK_MSGQ ||
             erts_proc_trylock(rp, ERTS_PROC_LOCK_MSGQ) == EBUSY) {
+
+            ERL_MESSAGE_TERM(mp) = msg;
+            ERL_MESSAGE_FROM(mp) = from;
 
             if (!msgq) {
                 msgq = erts_alloc(ERTS_ALC_T_TRACE_MSG_QUEUE,
@@ -803,8 +850,7 @@ int enif_send(ErlNifEnv* env, const ErlNifPid* to_pid,
         }
     }
 
-    erts_queue_message(rp, rp_locks, mp, msg,
-                       c_p ? c_p->common.id : am_undefined);
+    erts_queue_message(rp, rp_locks, mp, msg, from);
 
 done:
     if (c_p == rp)
@@ -1019,11 +1065,6 @@ int enif_is_number(ErlNifEnv* env, ERL_NIF_TERM term)
     return is_number(term);
 }
 
-static ERTS_INLINE int is_proc_bound(ErlNifEnv* env)
-{
-    return env->mod_nif != NULL;
-}
-
 static void aligned_binary_dtor(struct enif_tmp_obj_t* obj)
 {
     erts_free_aligned_binary_bytes_extra((byte*)obj, obj->allocator);
@@ -1058,22 +1099,14 @@ int enif_inspect_binary(ErlNifEnv* env, Eterm bin_term, ErlNifBinary* bin)
 	u.tmp->dtor = &aligned_binary_dtor;
 	env->tmp_obj_list = u.tmp;
     }
-    bin->bin_term = bin_term;
     bin->size = binary_size(bin_term);
     bin->ref_bin = NULL;
     ADD_READONLY_CHECK(env, bin->data, bin->size);
     return 1;
 }
 
-static void tmp_alloc_dtor(struct enif_tmp_obj_t* obj)
-{
-    erts_free(obj->allocator,  obj);
-}
-
 int enif_inspect_iolist_as_binary(ErlNifEnv* env, Eterm term, ErlNifBinary* bin)
 {
-    struct enif_tmp_obj_t* tobj;
-    ErtsAlcType_t allocator;
     ErlDrvSizeT sz;
     if (is_binary(term)) {
 	return enif_inspect_binary(env,term,bin);
@@ -1081,7 +1114,6 @@ int enif_inspect_iolist_as_binary(ErlNifEnv* env, Eterm term, ErlNifBinary* bin)
     if (is_nil(term)) {
 	bin->data = (unsigned char*) &bin->data; /* dummy non-NULL */
 	bin->size = 0;
-	bin->bin_term = THE_NON_VALUE;
 	bin->ref_bin = NULL;
 	return 1;
     }
@@ -1089,16 +1121,8 @@ int enif_inspect_iolist_as_binary(ErlNifEnv* env, Eterm term, ErlNifBinary* bin)
 	return 0;
     }
 
-    allocator = is_proc_bound(env) ? ERTS_ALC_T_TMP : ERTS_ALC_T_NIF;
-    tobj = erts_alloc(allocator, sz + sizeof(struct enif_tmp_obj_t));
-    tobj->allocator = allocator;
-    tobj->next = env->tmp_obj_list;
-    tobj->dtor = &tmp_alloc_dtor;
-    env->tmp_obj_list = tobj;
-
-    bin->data = (unsigned char*) &tobj[1]; 
+    bin->data = alloc_tmp_obj(env, sz, &tmp_alloc_dtor);
     bin->size = sz;
-    bin->bin_term = THE_NON_VALUE;
     bin->ref_bin = NULL;
     erts_iolist_to_buf(term, (char*) bin->data, sz);
     ADD_READONLY_CHECK(env, bin->data, bin->size); 
@@ -1116,7 +1140,6 @@ int enif_alloc_binary(size_t size, ErlNifBinary* bin)
 
     bin->size = size;
     bin->data = (unsigned char*) refbin->orig_bytes;
-    bin->bin_term = THE_NON_VALUE;
     bin->ref_bin = refbin;
     return 1;
 }
@@ -1150,12 +1173,10 @@ void enif_release_binary(ErlNifBinary* bin)
 {
     if (bin->ref_bin != NULL) {
 	Binary* refbin = bin->ref_bin;
-	ASSERT(bin->bin_term == THE_NON_VALUE);
         erts_bin_release(refbin);
     }
 #ifdef DEBUG
     bin->data = NULL;
-    bin->bin_term = THE_NON_VALUE;
     bin->ref_bin = NULL;
 #endif
 }
@@ -1312,39 +1333,51 @@ int enif_get_string(ErlNifEnv *env, ERL_NIF_TERM list, char* buf, unsigned len,
 
 Eterm enif_make_binary(ErlNifEnv* env, ErlNifBinary* bin)
 {
-    if (bin->bin_term != THE_NON_VALUE) {
-	return bin->bin_term;
+    Eterm bin_term;
+
+    if (bin->ref_bin != NULL) {
+        Binary* binary = bin->ref_bin;
+
+        /* If the binary is smaller than the heap binary limit we'll return a
+         * heap binary to reduce the number of small refc binaries in the
+         * system. We can't simply release the refc binary right away however;
+         * the documentation states that the binary should be considered
+         * read-only from this point on, which implies that it should still be
+         * readable.
+         *
+         * We could keep it alive until we return by adding it to the temporary
+         * object list, but that requires an off-heap allocation which is
+         * potentially quite slow, so we create a dummy ProcBin instead and
+         * rely on the next minor GC to get rid of it. */
+        if (bin->size <= ERL_ONHEAP_BIN_LIMIT) {
+            ErlHeapBin* hb;
+
+            hb = (ErlHeapBin*)alloc_heap(env, heap_bin_size(bin->size));
+            hb->thing_word = header_heap_bin(bin->size);
+            hb->size = bin->size;
+
+            sys_memcpy(hb->data, bin->data, bin->size);
+
+            erts_build_proc_bin(&MSO(env->proc),
+                                alloc_heap(env, PROC_BIN_SIZE),
+                                binary);
+
+            bin_term = make_binary(hb);
+        } else {
+            bin_term = erts_build_proc_bin(&MSO(env->proc),
+                                           alloc_heap(env, PROC_BIN_SIZE),
+                                           binary);
+        }
+
+        /* Our (possibly shared) ownership has been transferred to the term. */
+        bin->ref_bin = NULL;
+    } else {
+        flush_env(env);
+        bin_term = new_binary(env->proc, bin->data, bin->size);
+        cache_env(env);
     }
-    else if (bin->ref_bin != NULL) {
-	Binary* bptr = bin->ref_bin;
-	ProcBin* pb;
-	Eterm bin_term;
-	
-	/* !! Copy-paste from new_binary() !! */
-	pb = (ProcBin *) alloc_heap(env, PROC_BIN_SIZE);
-	pb->thing_word = HEADER_PROC_BIN;
-	pb->size = bptr->orig_size;
-	pb->next = MSO(env->proc).first;
-	MSO(env->proc).first = (struct erl_off_heap_header*) pb;
-	pb->val = bptr;
-	pb->bytes = (byte*) bptr->orig_bytes;
-	pb->flags = 0;
-	
-	OH_OVERHEAD(&(MSO(env->proc)), pb->size / sizeof(Eterm));
-	bin_term = make_binary(pb);	
-	if (erts_refc_read(&bptr->intern.refc, 1) == 1) {
-	    /* Total ownership transfer */
-	    bin->ref_bin = NULL;
-	    bin->bin_term = bin_term;
-	}
-	return bin_term;
-    }
-    else {
-	flush_env(env);
-	bin->bin_term = new_binary(env->proc, bin->data, bin->size);
-	cache_env(env);
-	return bin->bin_term;
-    }
+
+    return bin_term;
 }
 
 Eterm enif_make_sub_binary(ErlNifEnv* env, ERL_NIF_TERM bin_term,
@@ -1933,6 +1966,12 @@ ErlNifTid enif_thread_self(void) { return erl_drv_thread_self(); }
 int enif_equal_tids(ErlNifTid tid1, ErlNifTid tid2) { return erl_drv_equal_tids(tid1,tid2); }
 void enif_thread_exit(void *resp) { erl_drv_thread_exit(resp); }
 int enif_thread_join(ErlNifTid tid, void **respp) { return erl_drv_thread_join(tid,respp); }
+
+char* enif_mutex_name(ErlNifMutex *mtx) {return erl_drv_mutex_name(mtx); }
+char* enif_cond_name(ErlNifCond *cnd) { return erl_drv_cond_name(cnd); }
+char* enif_rwlock_name(ErlNifRWLock* rwlck) { return erl_drv_rwlock_name(rwlck); }
+char* enif_thread_name(ErlNifTid tid) { return erl_drv_thread_name(tid); }
+
 int enif_getenv(const char *key, char *value, size_t *value_size) { return erl_drv_getenv(key, value, value_size); }
 
 ErlNifTime enif_monotonic_time(ErlNifTimeUnit time_unit)
@@ -1955,15 +1994,20 @@ enif_convert_time_unit(ErlNifTime val,
 						    (int) to);
 }
 
-int enif_fprintf(void* filep, const char* format, ...) 
+int enif_fprintf(FILE* filep, const char* format, ...)
 { 
     int ret;
     va_list arglist;
     va_start(arglist, format);
-    ret = erts_vfprintf((FILE*)filep, format, arglist);
+    ret = erts_vfprintf(filep, format, arglist);
     va_end(arglist);
     return ret;
 }    
+
+int enif_vfprintf(FILE* filep, const char *format, va_list ap)
+{
+    return erts_vfprintf(filep, format, ap);
+}
 
 int enif_snprintf(char *buffer, size_t size, const char* format, ...) 
 { 
@@ -1974,6 +2018,12 @@ int enif_snprintf(char *buffer, size_t size, const char* format, ...)
     va_end(arglist);
     return ret;
 }
+
+int enif_vsnprintf(char* buffer, size_t size, const char *format, va_list ap)
+{
+    return erts_vsnprintf(buffer, size, format, ap);
+}
+
 
 /***********************************************************
  **       Memory managed (GC'ed) "resource" objects       **
@@ -2176,70 +2226,60 @@ static void rollback_opened_resource_types(void)
     }
 }
 
-struct destroy_monitor_ctx
+#ifdef ARCH_64
+#  define ERTS_RESOURCE_DYING_FLAG (((Uint) 1) << 63)
+#else
+#  define ERTS_RESOURCE_DYING_FLAG (((Uint) 1) << 31)
+#endif
+#define ERTS_RESOURCE_REFC_MASK (~ERTS_RESOURCE_DYING_FLAG)
+
+static ERTS_INLINE void
+rmon_set_dying(ErtsResourceMonitors *rms)
 {
-    ErtsResource* resource;
-    int exiting_procs;
-    int scheduler;
-};
-
-static void destroy_one_monitor(ErtsMonitor* mon, void* context)
-{
-    struct destroy_monitor_ctx* ctx = (struct destroy_monitor_ctx*) context;
-    Process* rp;
-    ErtsMonitor *rmon = NULL;
-    int is_exiting;
-
-    ASSERT(mon->type == MON_ORIGIN);
-    ASSERT(is_internal_pid(mon->u.pid));
-    ASSERT(is_internal_ref(mon->ref));
-
-    if (ctx->scheduler > 0) { /* Normal scheduler */
-        rp = erts_proc_lookup(mon->u.pid);
-    }
-    else {
-        rp = erts_proc_lookup_inc_refc(mon->u.pid);
-    }
-
-    if (!rp) {
-        is_exiting = 1;
-    }
-    if (rp) {
-        erts_proc_lock(rp, ERTS_PROC_LOCK_LINK);
-        if (ERTS_PROC_IS_EXITING(rp)) {
-            is_exiting = 1;
-        } else {
-            rmon = erts_remove_monitor(&ERTS_P_MONITORS(rp), mon->ref);
-            ASSERT(rmon);
-            is_exiting = 0;
-        }
-        erts_proc_unlock(rp, ERTS_PROC_LOCK_LINK);
-        if (ctx->scheduler <= 0)
-            erts_proc_dec_refc(rp);
-    }
-    if (is_exiting) {
-        ctx->resource->monitors->pending_failed_fire++;
-    }
-
-    /* ToDo: Delay destruction after monitor_locks */
-    if (rmon) {
-        ASSERT(rmon->type == MON_NIF_TARGET);
-        ASSERT(rmon->u.resource == ctx->resource);
-        erts_destroy_monitor(rmon);
-    }
-    erts_destroy_monitor(mon);
+    rms->refc |= ERTS_RESOURCE_DYING_FLAG;
 }
 
-static void destroy_all_monitors(ErtsMonitor* monitors, ErtsResource* resource)
+static ERTS_INLINE int
+rmon_is_dying(ErtsResourceMonitors *rms)
 {
-    struct destroy_monitor_ctx ctx;
-
-    execution_state(NULL, NULL, &ctx.scheduler);
-
-    ctx.resource = resource;
-    erts_sweep_monitors(monitors, &destroy_one_monitor, &ctx);
+    return !!(rms->refc & ERTS_RESOURCE_DYING_FLAG);
 }
 
+static ERTS_INLINE void
+rmon_refc_inc(ErtsResourceMonitors *rms)
+{
+    rms->refc++;
+}
+
+static ERTS_INLINE Uint
+rmon_refc_dec_read(ErtsResourceMonitors *rms)
+{
+    Uint res;
+    ASSERT((rms->refc & ERTS_RESOURCE_REFC_MASK) != 0);
+    res = --rms->refc;
+    return res & ERTS_RESOURCE_REFC_MASK;
+}
+
+static ERTS_INLINE void
+rmon_refc_dec(ErtsResourceMonitors *rms)
+{
+    ASSERT((rms->refc & ERTS_RESOURCE_REFC_MASK) != 0);
+    --rms->refc;
+}
+
+static ERTS_INLINE Uint
+rmon_refc_read(ErtsResourceMonitors *rms)
+{
+    return rms->refc & ERTS_RESOURCE_REFC_MASK;
+}
+
+static void dtor_demonitor(ErtsMonitor* mon, void* context)
+{
+    ASSERT(erts_monitor_is_origin(mon));
+    ASSERT(is_internal_pid(mon->other.item));
+
+    erts_proc_sig_send_demonitor(mon);
+}
 
 #  define NIF_RESOURCE_DTOR &nif_resource_dtor
 
@@ -2251,34 +2291,36 @@ static int nif_resource_dtor(Binary* bin)
 
     if (resource->monitors) {
         ErtsResourceMonitors* rm = resource->monitors;
+        int kill;
+        ErtsMonitor *root;
+        Uint refc;
 
         ASSERT(type->down);
         erts_mtx_lock(&rm->lock);
         ASSERT(erts_refc_read(&bin->intern.refc, 0) == 0);
-        if (rm->root) {
-            ASSERT(!rm->is_dying);
-            destroy_all_monitors(rm->root, resource);
+        kill = !rmon_is_dying(rm);
+        if (kill) {
+            rmon_set_dying(rm);
+            root = rm->root;
             rm->root = NULL;
         }
-        if (rm->pending_failed_fire) {
-            /*
-             * Resource death struggle prolonged to serve exiting process(es).
-             * Destructor will be called again when last exiting process
-             * tries to fire its MON_NIF_TARGET monitor (and fails).
-             *
-             * This resource is doomed. It has no "real" references and
-             * should get not get called upon to do anything except the
-             * final destructor call.
-             *
-             * We keep refc at 0 and use a separate counter for exiting
-             * processes to avoid resource getting revived by "dec_term".
-             */
-            ASSERT(!rm->is_dying);
-            rm->is_dying = 1;
-            erts_mtx_unlock(&rm->lock);
-            return 0;
-        }
+        refc = rmon_refc_read(rm);
         erts_mtx_unlock(&rm->lock);
+
+        if (kill)
+            erts_monitor_tree_foreach_delete(&root,
+                                             dtor_demonitor,
+                                             NULL);
+
+        /*
+         * If resource->monitors->refc != 0 there are
+         * outstanding references to the resource from
+         * monitors that has not been removed yet.
+         * nif_resource_dtor() will be called again this
+         * reference count reach zero.
+         */
+        if (refc != 0)
+            return 0; /* we'll be back... */
         erts_mtx_destroy(&rm->lock);
     }
 
@@ -2308,54 +2350,82 @@ void erts_resource_stop(ErtsResource* resource, ErlNifEvent e,
     post_nif_noproc(&msg_env);
 }
 
-void erts_fire_nif_monitor(ErtsResource* resource, Eterm pid, Eterm ref)
+void erts_nif_demonitored(ErtsResource* resource)
 {
-    ErtsMonitor* rmon;
-    ErtsBinary* bin = ERTS_MAGIC_BIN_FROM_UNALIGNED_DATA(resource);
-    struct enif_msg_environment_t msg_env;
-    ErlNifPid nif_pid;
-    ErlNifMonitor nif_monitor;
     ErtsResourceMonitors* rmp = resource->monitors;
+    ErtsBinary* bin = ERTS_MAGIC_BIN_FROM_UNALIGNED_DATA(resource);
+    int free_me;
 
     ASSERT(rmp);
     ASSERT(resource->type->down);
 
     erts_mtx_lock(&rmp->lock);
-    rmon = erts_remove_monitor(&rmp->root, ref);
-    if (!rmon) {
-        int free_me = (--rmp->pending_failed_fire == 0) && rmp->is_dying;
-        ASSERT(rmp->pending_failed_fire >= 0);
-        erts_mtx_unlock(&rmp->lock);
+    free_me = ((rmon_refc_dec_read(rmp) == 0) & !!rmon_is_dying(rmp));
+    erts_mtx_unlock(&rmp->lock);
 
-        if (free_me) {
-            ASSERT(erts_refc_read(&bin->binary.intern.refc, 0) == 0);
-            erts_bin_free(&bin->binary);
-        }
-        return;
+    if (free_me)
+        erts_bin_free(&bin->binary);
+}
+
+void erts_fire_nif_monitor(ErtsMonitor *tmon)
+{
+    ErtsResource* resource;
+    ErtsMonitorData *mdp;
+    ErtsMonitor *omon;
+    ErtsBinary* bin;
+    struct enif_msg_environment_t msg_env;
+    ErlNifPid nif_pid;
+    ErlNifMonitor nif_monitor;
+    ErtsResourceMonitors* rmp;
+    Uint mrefc, brefc;
+    int active, is_dying;
+
+    ASSERT(tmon->type == ERTS_MON_TYPE_RESOURCE);
+    ASSERT(erts_monitor_is_target(tmon));
+
+    resource = tmon->other.ptr;
+    bin = ERTS_MAGIC_BIN_FROM_UNALIGNED_DATA(resource);
+    rmp = resource->monitors;
+
+    mdp = erts_monitor_to_data(tmon);
+    omon = &mdp->origin;
+
+    ASSERT(rmp);
+    ASSERT(resource->type->down);
+
+    erts_mtx_lock(&rmp->lock);
+
+    mrefc = rmon_refc_dec_read(rmp);
+    is_dying = rmon_is_dying(rmp);
+    active = !is_dying && erts_monitor_is_in_table(omon);
+
+    if (active) {
+        erts_monitor_tree_delete(&rmp->root, omon);
+        brefc = (Uint) erts_refc_inc_unless(&bin->binary.intern.refc, 0, 0);
     }
-    ASSERT(!rmp->is_dying);
-    if (erts_refc_inc_unless(&bin->binary.intern.refc, 0, 0) == 0) {
-        /*
-         * Racing resource destruction. 
-         * To avoid a more complex refc-dance with destructing thread
-         * we avoid calling 'down' and just silently remove the monitor.
-         * This can happen even for non smp as destructor calls may be scheduled.
-         */
-        erts_mtx_unlock(&rmp->lock);
+
+    erts_mtx_unlock(&rmp->lock);
+
+    if (!active) {
+        ASSERT(!is_dying || erts_refc_read(&bin->binary.intern.refc, 0) == 0);
+        if (is_dying && mrefc == 0)
+            erts_bin_free(&bin->binary);
+        erts_monitor_release(tmon);
     }
     else {
-        erts_mtx_unlock(&rmp->lock);
+        if (brefc > 0) {
+            ASSERT(is_internal_pid(omon->other.item));
+            erts_ref_to_driver_monitor(mdp->ref, &nif_monitor);
+            nif_pid.pid = omon->other.item;
+            pre_nif_noproc(&msg_env, resource->type->owner, NULL);
+            resource->type->down(&msg_env.env, resource->data, &nif_pid, &nif_monitor);
+            post_nif_noproc(&msg_env);
 
-        ASSERT(rmon->u.pid == pid);
-        erts_ref_to_driver_monitor(ref, &nif_monitor);
-        nif_pid.pid = pid;
-        pre_nif_noproc(&msg_env, resource->type->owner, NULL);
-        resource->type->down(&msg_env.env, resource->data, &nif_pid, &nif_monitor);
-        post_nif_noproc(&msg_env);
+            erts_bin_release(&bin->binary);
+        }
 
-        erts_bin_release(&bin->binary);
+        erts_monitor_release_both(mdp);
     }
-    erts_destroy_monitor(rmon);
 }
 
 void* enif_alloc_resource(ErlNifResourceType* type, size_t data_sz)
@@ -2392,8 +2462,7 @@ void* enif_alloc_resource(ErlNifResourceType* type, size_t data_sz)
         erts_mtx_init(&resource->monitors->lock, "resource_monitors", NIL,
             ERTS_LOCK_FLAGS_CATEGORY_GENERIC);
         resource->monitors->root = NULL;
-        resource->monitors->pending_failed_fire = 0;
-        resource->monitors->is_dying = 0;
+        resource->monitors->refc = 0;
         resource->monitors->user_data_sz = data_sz;
     }
     else {
@@ -2408,7 +2477,7 @@ void enif_release_resource(void* obj)
     ErtsBinary* bin = ERTS_MAGIC_BIN_FROM_UNALIGNED_DATA(resource);
 
     ASSERT(ERTS_MAGIC_BIN_DESTRUCTOR(bin) == NIF_RESOURCE_DTOR);
-    ASSERT(!(resource->monitors && resource->monitors->is_dying));
+    ASSERT(erts_refc_read(&bin->binary.intern.refc, 0) != 0);
 #ifdef DEBUG
     erts_refc_dec(&resource->nif_refc, 0);
 #endif
@@ -2421,7 +2490,7 @@ void enif_keep_resource(void* obj)
     ErtsBinary* bin = ERTS_MAGIC_BIN_FROM_UNALIGNED_DATA(resource);
 
     ASSERT(ERTS_MAGIC_BIN_DESTRUCTOR(bin) == NIF_RESOURCE_DTOR);
-    ASSERT(!(resource->monitors && resource->monitors->is_dying));
+    ASSERT(erts_refc_read(&bin->binary.intern.refc, 0) != 0);
 #ifdef DEBUG
     erts_refc_inc(&resource->nif_refc, 1);
 #endif
@@ -2431,7 +2500,7 @@ void enif_keep_resource(void* obj)
 Eterm erts_bld_resource_ref(Eterm** hpp, ErlOffHeap* oh, ErtsResource* resource)
 {
     ErtsBinary* bin = ERTS_MAGIC_BIN_FROM_UNALIGNED_DATA(resource);
-    ASSERT(!(resource->monitors && resource->monitors->is_dying));
+    ASSERT(erts_refc_read(&bin->binary.intern.refc, 0) != 0);
     return erts_mk_magic_ref(hpp, oh, &bin->binary);
 }
 
@@ -2440,7 +2509,7 @@ ERL_NIF_TERM enif_make_resource(ErlNifEnv* env, void* obj)
     ErtsResource* resource = DATA_TO_RESOURCE(obj);
     ErtsBinary* bin = ERTS_MAGIC_BIN_FROM_UNALIGNED_DATA(resource);
     Eterm* hp = alloc_heap(env, ERTS_MAGIC_REF_THING_SIZE);
-    ASSERT(!(resource->monitors && resource->monitors->is_dying));
+    ASSERT(erts_refc_read(&bin->binary.intern.refc, 0) != 0);
     return erts_mk_magic_ref(&hp, &MSO(env->proc), &bin->binary);
 }
 
@@ -3120,123 +3189,88 @@ int enif_map_iterator_get_pair(ErlNifEnv *env,
 int enif_monitor_process(ErlNifEnv* env, void* obj, const ErlNifPid* target_pid,
                          ErlNifMonitor* monitor)
 {
-    int scheduler;
     ErtsResource* rsrc = DATA_TO_RESOURCE(obj);
-    Process *rp;
     Eterm tmp[ERTS_REF_THING_SIZE];
     Eterm ref;
-    int retval;
+    ErtsResourceMonitors *rm;
+    ErtsMonitorData *mdp;
 
     ASSERT(ERTS_MAGIC_BIN_FROM_UNALIGNED_DATA(rsrc)->magic_binary.destructor
            == NIF_RESOURCE_DTOR);
-    ASSERT(!(rsrc->monitors && rsrc->monitors->is_dying));
+    ASSERT(erts_refc_read(&ERTS_MAGIC_BIN_FROM_UNALIGNED_DATA(rsrc)->binary.intern.refc, 0) != 0);
     ASSERT(!rsrc->monitors == !rsrc->type->down);
 
-
-    if (!rsrc->monitors) {
+    rm = rsrc->monitors;
+    if (!rm) {
         ASSERT(!rsrc->type->down);
         return -1;
     }
     ASSERT(rsrc->type->down);
 
-    execution_state(env, NULL, &scheduler);
-
-    if (scheduler > 0) /* Normal scheduler */
-        rp = erts_proc_lookup_raw(target_pid->pid);
-    else
-        rp = erts_proc_lookup_raw_inc_refc(target_pid->pid);
-
-    if (!rp)
-        return 1;
-
     ref = erts_make_ref_in_buffer(tmp);
 
-    erts_mtx_lock(&rsrc->monitors->lock);
-    erts_proc_lock(rp, ERTS_PROC_LOCK_LINK);
-    if (ERTS_PSFLG_FREE & erts_atomic32_read_nob(&rp->state)) {
-        retval = 1;
-    }
-    else {
-        erts_add_monitor(&rsrc->monitors->root, MON_ORIGIN, ref, rp->common.id, NIL);
-        erts_add_monitor(&ERTS_P_MONITORS(rp), MON_NIF_TARGET, ref, (UWord)rsrc, NIL);
-        retval = 0;
-    }
-    erts_proc_unlock(rp, ERTS_PROC_LOCK_LINK);
-    erts_mtx_unlock(&rsrc->monitors->lock);
+    mdp = erts_monitor_create(ERTS_MON_TYPE_RESOURCE, ref,
+                              (Eterm) rsrc, target_pid->pid, NIL);
+    erts_mtx_lock(&rm->lock);
+    ASSERT(!rmon_is_dying(rm));
+    erts_monitor_tree_insert(&rm->root, &mdp->origin);
+    rmon_refc_inc(rm);
+    erts_mtx_unlock(&rm->lock);
 
-    if (scheduler <= 0)
-        erts_proc_dec_refc(rp);
+    if (!erts_proc_sig_send_monitor(&mdp->target, target_pid->pid)) {
+        /* Failed to send monitor signal; cleanup... */
+#ifdef DEBUG
+        ErtsBinary* bin = ERTS_MAGIC_BIN_FROM_UNALIGNED_DATA(rsrc);
+#endif
+
+        erts_mtx_lock(&rm->lock);
+        ASSERT(!rmon_is_dying(rm));
+        erts_monitor_tree_delete(&rm->root, &mdp->origin);
+        rmon_refc_dec(rm);
+        ASSERT(erts_refc_read(&bin->binary.intern.refc, 1) != 0);
+        erts_mtx_unlock(&rm->lock);
+        erts_monitor_release_both(mdp);
+
+        return 1;
+    }
+
     if (monitor)
         erts_ref_to_driver_monitor(ref,monitor);
 
-    return retval;
+    return 0;
 }
 
 int enif_demonitor_process(ErlNifEnv* env, void* obj, const ErlNifMonitor* monitor)
 {
-    int scheduler;
     ErtsResource* rsrc = DATA_TO_RESOURCE(obj);
 #ifdef DEBUG
     ErtsBinary* bin = ERTS_MAGIC_BIN_FROM_UNALIGNED_DATA(rsrc);
 #endif
-    Process *rp;
+    ErtsResourceMonitors *rm;
     ErtsMonitor *mon;
-    ErtsMonitor *rmon = NULL;
     Eterm ref_heap[ERTS_REF_THING_SIZE];
     Eterm ref;
-    int is_exiting;
 
     ASSERT(bin->magic_binary.destructor == NIF_RESOURCE_DTOR);
-    ASSERT(!(rsrc->monitors && rsrc->monitors->is_dying));
-
-    execution_state(env, NULL, &scheduler);
+    ASSERT(erts_refc_read(&bin->binary.intern.refc, 0) != 0);
 
     ref = erts_driver_monitor_to_ref(ref_heap, monitor);
 
-    erts_mtx_lock(&rsrc->monitors->lock);
-    mon = erts_remove_monitor(&rsrc->monitors->root, ref);
+    rm = rsrc->monitors;
+    erts_mtx_lock(&rm->lock);
+    ASSERT(!rmon_is_dying(rm));
+    mon = erts_monitor_tree_lookup(rm->root, ref);
+    if (mon)
+        erts_monitor_tree_delete(&rm->root, mon);
+    erts_mtx_unlock(&rm->lock);
 
-    if (mon == NULL) {
-        erts_mtx_unlock(&rsrc->monitors->lock);
+    if (!mon)
         return 1;
-    }
 
-    ASSERT(mon->type == MON_ORIGIN);
-    ASSERT(is_internal_pid(mon->u.pid));
+    ASSERT(erts_monitor_is_origin(mon));
+    ASSERT(is_internal_pid(mon->other.item));
 
-    if (scheduler > 0) /* Normal scheduler */
-        rp = erts_proc_lookup(mon->u.pid);
-    else
-        rp = erts_proc_lookup_inc_refc(mon->u.pid);
-
-    if (!rp) {
-        is_exiting = 1;
-    }
-    else {
-        erts_proc_lock(rp, ERTS_PROC_LOCK_LINK);
-        if (ERTS_PROC_IS_EXITING(rp)) {
-            is_exiting = 1;
-        } else {
-            rmon = erts_remove_monitor(&ERTS_P_MONITORS(rp), ref);
-            ASSERT(rmon);
-            is_exiting = 0;
-        }
-        erts_proc_unlock(rp, ERTS_PROC_LOCK_LINK);
-
-        if (scheduler <= 0)
-            erts_proc_dec_refc(rp);
-    }
-    if (is_exiting) {
-        rsrc->monitors->pending_failed_fire++;
-    }
-    erts_mtx_unlock(&rsrc->monitors->lock);
-
-    if (rmon) {
-        ASSERT(rmon->type == MON_NIF_TARGET);
-        ASSERT(rmon->u.resource == rsrc);
-        erts_destroy_monitor(rmon);
-    }
-    erts_destroy_monitor(mon);
+    erts_proc_sig_send_demonitor(mon);
 
     return 0;
 }
@@ -3294,8 +3328,8 @@ typedef struct {
     Eterm sublist_start;
     Eterm sublist_end;
 
-    UWord offheap_size;
-    UWord onheap_size;
+    UWord referenced_size;
+    UWord copied_size;
 
     UWord iovec_len;
 } iovec_slice_t;
@@ -3305,16 +3339,16 @@ static int examine_iovec_term(Eterm list, UWord max_length, iovec_slice_t *resul
 
     result->sublist_start = list;
     result->sublist_length = 0;
-    result->offheap_size = 0;
-    result->onheap_size = 0;
+    result->referenced_size = 0;
+    result->copied_size = 0;
     result->iovec_len = 0;
 
     lookahead = result->sublist_start;
 
     while (is_list(lookahead)) {
-        Eterm *binary_header, binary;
+        UWord byte_size;
+        Eterm binary;
         Eterm *cell;
-        UWord size;
 
         cell = list_val(lookahead);
         binary = CAR(cell);
@@ -3323,35 +3357,36 @@ static int examine_iovec_term(Eterm list, UWord max_length, iovec_slice_t *resul
             return 0;
         }
 
-        size = binary_size(binary);
-        binary_header = binary_val(binary);
+        byte_size = binary_size(binary);
 
-        if (size > 0) {
-            /* If we're a sub-binary we'll need to check our underlying binary
-             * to determine whether we're on-heap or not. */
-            if (thing_subtag(*binary_header) == SUB_BINARY_SUBTAG) {
-                ErlSubBin *sb = (ErlSubBin*)binary_header;
+        if (byte_size > 0) {
+            int bit_offset, bit_size;
+            Eterm parent_binary;
+            UWord byte_offset;
 
-                /* Reject bitstrings */
-                if((sb->bitoffs + sb->bitsize) > 0) {
-                    return 0;
-                }
+            int requires_copying;
 
-                ASSERT(size <= binary_size(sb->orig));
-                binary_header = binary_val(sb->orig);
+            ERTS_GET_REAL_BIN(binary, parent_binary, byte_offset,
+                bit_offset, bit_size);
+
+            (void)byte_offset;
+
+            if (bit_size != 0) {
+                return 0;
             }
 
-            if (thing_subtag(*binary_header) == HEAP_BINARY_SUBTAG) {
-                ASSERT(size <= ERL_ONHEAP_BIN_LIMIT);
+            /* If we're unaligned or an on-heap binary we'll need to copy
+             * ourselves over to a temporary buffer. */
+            requires_copying = (bit_offset != 0) ||
+                thing_subtag(*binary_val(parent_binary)) == HEAP_BINARY_SUBTAG;
 
-                result->iovec_len += 1;
-                result->onheap_size += size;
+            if (requires_copying) {
+                result->copied_size += byte_size;
             } else {
-                ASSERT(thing_subtag(*binary_header) == REFC_BINARY_SUBTAG);
-
-                result->iovec_len += 1 + size / MAX_SYSIOVEC_IOVLEN;
-                result->offheap_size += size;
+                result->referenced_size += byte_size;
             }
+
+            result->iovec_len += 1 + byte_size / MAX_SYSIOVEC_IOVLEN;
         }
 
         result->sublist_length += 1;
@@ -3371,7 +3406,9 @@ static int examine_iovec_term(Eterm list, UWord max_length, iovec_slice_t *resul
     return 1;
 }
 
-static void inspect_raw_binary_data(Eterm binary, ErlNifBinary *result) {
+static void marshal_iovec_binary(Eterm binary, ErlNifBinary *copy_buffer,
+        UWord *copy_offset, ErlNifBinary *result) {
+
     Eterm *parent_header;
     Eterm parent_binary;
 
@@ -3382,10 +3419,11 @@ static void inspect_raw_binary_data(Eterm binary, ErlNifBinary *result) {
 
     ERTS_GET_REAL_BIN(binary, parent_binary, byte_offset, bit_offset, bit_size);
 
+    ASSERT(bit_size == 0);
+
     parent_header = binary_val(parent_binary);
 
     result->size = binary_size(binary);
-    result->bin_term = binary;
 
     if (thing_subtag(*parent_header) == REFC_BINARY_SUBTAG) {
         ProcBin *pb = (ProcBin*)parent_header;
@@ -3408,24 +3446,48 @@ static void inspect_raw_binary_data(Eterm binary, ErlNifBinary *result) {
         result->data = &((unsigned char*)&hb->data)[byte_offset];
         result->ref_bin = NULL;
     }
+
+    /* If this isn't an *aligned* refc binary, copy its contents to the buffer
+     * and reference that instead. */
+
+    if (result->ref_bin == NULL || bit_offset != 0) {
+        ASSERT(copy_buffer->ref_bin != NULL && copy_buffer->data != NULL);
+        ASSERT(result->size <= (copy_buffer->size - *copy_offset));
+
+        if (bit_offset == 0) {
+            sys_memcpy(&copy_buffer->data[*copy_offset],
+                result->data, result->size);
+        } else {
+            erts_copy_bits(result->data, bit_offset, 1,
+                (byte*)&copy_buffer->data[*copy_offset], 0, 1,
+                result->size * 8);
+        }
+
+        result->data = &copy_buffer->data[*copy_offset];
+        result->ref_bin = copy_buffer->ref_bin;
+
+        *copy_offset += result->size;
+    }
 }
 
 static int fill_iovec_with_slice(ErlNifEnv *env,
                                  iovec_slice_t *slice,
                                  ErlNifIOVec *iovec) {
-    UWord onheap_offset, iovec_idx;
-    ErlNifBinary onheap_data;
+    ErlNifBinary copy_buffer = {0};
+    UWord copy_offset, iovec_idx;
     Eterm sublist_iterator;
 
-    /* Set up a common refc binary for all on-heap binaries. */
-    if (slice->onheap_size > 0) {
-        if (!enif_alloc_binary(slice->onheap_size, &onheap_data)) {
+    /* Set up a common refc binary for all on-heap and unaligned binaries. */
+    if (slice->copied_size > 0) {
+        if (!enif_alloc_binary(slice->copied_size, &copy_buffer)) {
             return 0;
         }
+
+        ASSERT(copy_buffer.ref_bin != NULL);
     }
 
     sublist_iterator = slice->sublist_start;
-    onheap_offset = 0;
+    copy_offset = 0;
     iovec_idx = 0;
 
     while (sublist_iterator != slice->sublist_end) {
@@ -3433,20 +3495,7 @@ static int fill_iovec_with_slice(ErlNifEnv *env,
         Eterm *cell;
 
         cell = list_val(sublist_iterator);
-        inspect_raw_binary_data(CAR(cell), &raw_data);
-
-        /* If this isn't a refc binary, copy its contents to the onheap buffer
-         * and reference that instead. */
-        if (raw_data.size > 0 && raw_data.ref_bin == NULL) {
-            ASSERT(onheap_offset < onheap_data.size);
-            ASSERT(slice->onheap_size > 0);
-
-            sys_memcpy(&onheap_data.data[onheap_offset],
-                       raw_data.data, raw_data.size);
-
-            raw_data.data = &onheap_data.data[onheap_offset];
-            raw_data.ref_bin = onheap_data.ref_bin;
-        }
+        marshal_iovec_binary(CAR(cell), &copy_buffer, &copy_offset, &raw_data);
 
         while (raw_data.size > 0) {
             UWord chunk_len = MIN(raw_data.size, MAX_SYSIOVEC_IOVLEN);
@@ -3477,16 +3526,18 @@ static int fill_iovec_with_slice(ErlNifEnv *env,
             erts_refc_inc(&refc_binary->intern.refc, 1);
         }
 
-        if (slice->onheap_size > 0) {
+        if (slice->copied_size > 0) {
             /* Transfer ownership to the iovec; we've taken references to it in
              * the above loop. */
-            enif_release_binary(&onheap_data);
+            enif_release_binary(&copy_buffer);
         }
     } else {
-        if (slice->onheap_size > 0) {
-            /* Attach the binary to our environment and let the GC take care of
-             * it after returning. */
-            enif_make_binary(env, &onheap_data);
+        if (slice->copied_size > 0) {
+            /* Attach the binary to our environment and let the next minor GC
+             * get rid of it. This is slightly faster than using the tmp object
+             * list since it avoids off-heap allocations. */
+            erts_build_proc_bin(&MSO(env->proc),
+                alloc_heap(env, PROC_BIN_SIZE), copy_buffer.ref_bin);
         }
     }
 
@@ -3512,19 +3563,14 @@ static int create_iovec_from_slice(ErlNifEnv *env,
         alloc_size = binv_offset;
         alloc_size += slice->iovec_len * sizeof(Binary*);
 
-        /* If we have an environment we'll attach the allocated data to it. The
-         * GC will take care of releasing it later on. */
+        /* When the user passes an environment, we attach the iovec to it so
+         * the user won't have to bother managing it (similar to
+         * enif_inspect_binary). It'll disappear once the environment is
+         * cleaned up. */
         if (env != NULL) {
-            ErlNifBinary gc_bin;
-
-            if (!enif_alloc_binary(alloc_size, &gc_bin)) {
-                return 0;
-            }
-
-            alloc_base = (char*)gc_bin.data;
-            enif_make_binary(env, &gc_bin);
+            alloc_base = alloc_tmp_obj(env, alloc_size, &tmp_alloc_dtor);
         } else {
-            alloc_base = enif_alloc(alloc_size);
+            alloc_base = erts_alloc(ERTS_ALC_T_NIF, alloc_size);
         }
 
         iovec = (ErlNifIOVec*)alloc_base;
@@ -3533,12 +3579,12 @@ static int create_iovec_from_slice(ErlNifEnv *env,
         iovec->flags = 0;
     }
 
-    iovec->size = slice->offheap_size + slice->onheap_size;
+    iovec->size = slice->referenced_size + slice->copied_size;
     iovec->iovcnt = slice->iovec_len;
 
     if(!fill_iovec_with_slice(env, slice, iovec)) {
         if (env == NULL && !(iovec->flags & ERL_NIF_IOVEC_FLAGS_PREALLOC)) {
-            enif_free(iovec);
+            erts_free(ERTS_ALC_T_NIF, iovec);
         }
 
         return 0;
@@ -3814,6 +3860,11 @@ static struct erl_module_nif* create_lib(const ErlNifEntry* src)
     } else {
         dst->sizeof_ErlNifResourceTypeInit = 0;
     }
+    if (AT_LEAST_VERSION(src, 2, 14)) {
+        dst->min_erts = src->min_erts;
+    } else {
+        dst->min_erts = "erts-?";
+    }
     return lib;
 };
 
@@ -3926,14 +3977,20 @@ BIF_RETTYPE load_nif_2(BIF_ALIST_2)
 	      (entry = erts_sys_ddll_call_nif_init(init_func)) == NULL)) {
 	ret = load_nif_error(BIF_P, bad_lib, "Library init-call unsuccessful");
     }
+    else if (entry->major > ERL_NIF_MAJOR_VERSION
+             || (entry->major == ERL_NIF_MAJOR_VERSION
+                 && entry->minor > ERL_NIF_MINOR_VERSION)) {
+        char* fmt = "That '%T' NIF library needs %s or newer. Either try to"
+            " recompile the NIF lib or use a newer erts runtime.";
+        ret = load_nif_error(BIF_P, bad_lib, fmt, mod_atom, entry->min_erts);
+    }
     else if (entry->major < ERL_NIF_MIN_REQUIRED_MAJOR_VERSION_ON_LOAD
-	     || (ERL_NIF_MAJOR_VERSION < entry->major
-		 || (ERL_NIF_MAJOR_VERSION == entry->major
-		     && ERL_NIF_MINOR_VERSION < entry->minor))
 	     || (entry->major==2 && entry->minor == 5)) { /* experimental maps */
 	
-	ret = load_nif_error(BIF_P, bad_lib, "Library version (%d.%d) not compatible (with %d.%d).",
-			     entry->major, entry->minor, ERL_NIF_MAJOR_VERSION, ERL_NIF_MINOR_VERSION);
+        char* fmt = "That old NIF library (%d.%d) is not compatible with this "
+            "erts runtime (%d.%d). Try recompile the NIF lib.";
+        ret = load_nif_error(BIF_P, bad_lib, fmt, entry->major, entry->minor,
+                             ERL_NIF_MAJOR_VERSION, ERL_NIF_MINOR_VERSION);
     }   
     else if (AT_LEAST_VERSION(entry, 2, 1)
 	     && sys_strcmp(entry->vm_variant, ERL_NIF_VM_VARIANT) != 0) {
@@ -4228,34 +4285,31 @@ static unsigned calc_checksum(unsigned char* ptr, unsigned size);
 
 struct readonly_check_t
 {
-    struct enif_tmp_obj_t hdr;
     unsigned char* ptr;
     unsigned size;
     unsigned checksum;
 };
 static void add_readonly_check(ErlNifEnv* env, unsigned char* ptr, unsigned sz)
 {
-    ErtsAlcType_t allocator = is_proc_bound(env) ? ERTS_ALC_T_TMP : ERTS_ALC_T_NIF;
-    struct readonly_check_t* obj = erts_alloc(allocator, 
-					      sizeof(struct readonly_check_t));
-    obj->hdr.allocator = allocator;
-    obj->hdr.next = env->tmp_obj_list;
-    env->tmp_obj_list = &obj->hdr;
-    obj->hdr.dtor = &readonly_check_dtor;
+    struct readonly_check_t* obj;
+
+    obj = alloc_tmp_obj(env, sizeof(struct readonly_check_t),
+        &readonly_check_dtor);
+
     obj->ptr = ptr;
     obj->size = sz;
-    obj->checksum = calc_checksum(ptr, sz);    
+    obj->checksum = calc_checksum(ptr, sz);
 }
-static void readonly_check_dtor(struct enif_tmp_obj_t* o)
+static void readonly_check_dtor(struct enif_tmp_obj_t* tmp_obj)
 {
-    struct readonly_check_t* obj = (struct readonly_check_t*) o;
-    unsigned chksum = calc_checksum(obj->ptr, obj->size);
-    if (chksum != obj->checksum) { 
+    struct readonly_check_t* ro_check = (struct readonly_check_t*)&tmp_obj[1];
+    unsigned chksum = calc_checksum(ro_check->ptr, ro_check->size);
+    if (chksum != ro_check->checksum) { 
 	fprintf(stderr, "\r\nReadonly data written by NIF, checksums differ"
-		" %x != %x\r\nABORTING\r\n", chksum, obj->checksum);
+		" %x != %x\r\nABORTING\r\n", chksum, ro_check->checksum);
 	abort();
     }
-    erts_free(obj->hdr.allocator,  obj);
+    erts_free(tmp_obj->allocator, tmp_obj);
 }
 static unsigned calc_checksum(unsigned char* ptr, unsigned size)
 {
@@ -4330,7 +4384,7 @@ static void get_string_maybe(ErlNifEnv *env, const ERL_NIF_TERM term,
         str_bin.size > bufsiz) {
         *ptr = NULL;
     } else {
-        memcpy(buf, (char *) str_bin.data, str_bin.size);
+        sys_memcpy(buf, (char *) str_bin.data, str_bin.size);
         buf[str_bin.size] = '\0';
         *ptr = buf;
     }
@@ -4347,7 +4401,7 @@ ERL_NIF_TERM erl_nif_user_trace_s1(ErlNifEnv* env, int argc,
 	    message_bin.size > MESSAGE_BUFSIZ) {
 	    return am_badarg;
 	}
-	memcpy(messagebuf, (char *) message_bin.data, message_bin.size);
+	sys_memcpy(messagebuf, (char *) message_bin.data, message_bin.size);
         messagebuf[message_bin.size] = '\0';
 	DTRACE1(user_trace_s1, messagebuf);
 	return am_true;

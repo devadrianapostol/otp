@@ -126,8 +126,10 @@ typedef struct {
     void *extra;
 } ErtsAllocatorFunctions_t;
 
-extern ErtsAllocatorFunctions_t erts_allctrs[ERTS_ALC_A_MAX+1];
-extern ErtsAllocatorInfo_t erts_allctrs_info[ERTS_ALC_A_MAX+1];
+extern ErtsAllocatorFunctions_t
+    ERTS_WRITE_UNLIKELY(erts_allctrs[ERTS_ALC_A_MAX+1]);
+extern ErtsAllocatorInfo_t
+    ERTS_WRITE_UNLIKELY(erts_allctrs_info[ERTS_ALC_A_MAX+1]);
 
 typedef struct {
     int enabled;
@@ -144,7 +146,7 @@ typedef struct ErtsAllocatorWrapper_t_ {
     void (*unlock)(void);
     struct ErtsAllocatorWrapper_t_* next;
 }ErtsAllocatorWrapper_t;
-ErtsAllocatorWrapper_t *erts_allctr_wrappers;
+extern ErtsAllocatorWrapper_t *erts_allctr_wrappers;
 extern int erts_allctr_wrapper_prelocked;
 extern erts_tsd_key_t erts_allctr_prelock_tsd_key;
 void erts_allctr_wrapper_prelock_init(ErtsAllocatorWrapper_t* wrapper);
@@ -168,6 +170,8 @@ __decl_noreturn void erts_realloc_n_enomem(ErtsAlcType_t,void*,Uint)
      __noreturn;
 __decl_noreturn void erts_alc_fatal_error(int,int,ErtsAlcType_t,...)	
      __noreturn;
+
+Eterm erts_alloc_set_dyn_param(struct process*, Eterm);
 
 #undef ERTS_HAVE_IS_IN_LITERAL_RANGE
 #if defined(ARCH_32) || defined(ERTS_HAVE_OS_PHYSICAL_MEMORY_RESERVATION)
@@ -430,7 +434,7 @@ NAME##_free(TYPE *p)							\
 
 #ifdef DEBUG
 #define ERTS_PRE_ALLOC_SIZE(SZ) ((SZ) < 1000 ? (SZ)/10 + 10 : 100)
-#define ERTS_PRE_ALLOC_CLOBBER(P, T) memset((void *) (P), 0xfd, sizeof(T))
+#define ERTS_PRE_ALLOC_CLOBBER(P, T) sys_memset((void *) (P), 0xfd, sizeof(T))
 #else
 #define ERTS_PRE_ALLOC_SIZE(SZ) ((SZ) > 1 ? (SZ) : 1)
 #define ERTS_PRE_ALLOC_CLOBBER(P, T)

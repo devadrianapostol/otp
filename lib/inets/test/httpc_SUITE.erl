@@ -37,6 +37,10 @@
 -define(TLS_URL_START, "https://").
 -define(NOT_IN_USE_PORT, 8997).
 
+%% Using hardcoded file path to keep it below 107 charaters
+%% (maximum length supported by erlang)
+-define(UNIX_SOCKET, "/tmp/inets_httpc_SUITE.sock").
+
 -record(sslsocket, {fd = nil, pid = nil}).
 %%--------------------------------------------------------------------
 %% Common Test interface functions -----------------------------------
@@ -50,6 +54,8 @@ all() ->
     [
      {group, http},
      {group, sim_http},
+     {group, http_internal},
+     {group, http_unix_socket},
      {group, https},
      {group, sim_https},
      {group, misc}
@@ -62,6 +68,8 @@ groups() ->
      %% and it shall be the last test case in the suite otherwise cookie
      %% will fail.
      {sim_http, [], only_simulated() ++ [process_leak_on_keepalive]},
+     {http_internal, [], real_requests_esi()},
+     {http_unix_socket, [], simulated_unix_socket()},
      {https, [], real_requests()},
      {sim_https, [], only_simulated()},
      {misc, [], misc()}
@@ -96,6 +104,12 @@ real_requests()->
      invalid_headers,
      invalid_body
     ].
+
+real_requests_esi() ->
+    [slow_connection].
+
+simulated_unix_socket() ->
+    [unix_domain_socket].
 
 only_simulated() ->
     [
@@ -182,15 +196,29 @@ init_per_group(Group, Config0) when Group =:= sim_https; Group =:= https->
         _:_ ->
             {skip, "Crypto did not start"}
     end;
-
+init_per_group(http_unix_socket = Group, Config0) ->
+    case os:type() of
+        {win32,_} ->
+            {skip, "Unix Domain Sockets are not supported on Windows"};
+        _ ->
+            file:delete(?UNIX_SOCKET),
+            start_apps(Group),
+            Config = proplists:delete(port, Config0),
+            Port = server_start(Group, server_config(Group, Config)),
+            [{port, Port} | Config]
+    end;
 init_per_group(Group, Config0) ->
     start_apps(Group),
     Config = proplists:delete(port, Config0),
     Port = server_start(Group, server_config(Group, Config)),
     [{port, Port} | Config].
 
+end_per_group(http_unix_socket,_Config) ->
+    file:delete(?UNIX_SOCKET),
+    ok;
 end_per_group(_, _Config) ->
     ok.
+
 do_init_per_group(Group, Config0) ->
     Config = proplists:delete(port, Config0),
     Port = server_start(Group, server_config(Group, Config)),
@@ -1245,7 +1273,40 @@ stream_fun_server_close(Config) when is_list(Config) ->
     after 13000 ->
             ct:fail(did_not_receive_close)
     end. 
-                                             
+
+%%--------------------------------------------------------------------
+slow_connection() ->
+    [{doc, "Test that a request on a slow keep-alive connection won't crash the httpc_manager"}].
+slow_connection(Config) when is_list(Config) ->
+    BodyFun = fun(0) -> eof;
+                 (LenLeft) -> timer:sleep(1000),
+                              {ok, lists:duplicate(10, "1"), LenLeft - 10}
+              end,
+    Request  = {url(group_name(Config), "/httpc_SUITE:esi_post", Config),
+                [{"content-length", "100"}],
+                "text/plain",
+                {BodyFun, 100}},
+    {ok, _} = httpc:request(post, Request, [], []),
+    %% Second request causes a crash if gen_server timeout is not set to infinity
+    %% in httpc_handler.
+    {ok, _} = httpc:request(post, Request, [], []).
+
+%%-------------------------------------------------------------------------
+unix_domain_socket() ->
+    [{"doc, Test HTTP requests over unix domain sockets"}].
+unix_domain_socket(Config) when is_list(Config) ->
+
+    URL = "http:///v1/kv/foo",
+
+    {ok,[{unix_socket,?UNIX_SOCKET}]} =
+        httpc:get_options([unix_socket]),
+    {ok, {{_,200,_}, [_ | _], _}}
+	= httpc:request(put, {URL, [], [], ""}, [], []),
+    {ok, {{_,200,_}, [_ | _], _}}
+        = httpc:request(get, {URL, []}, [], []).
+
+
+
 %%--------------------------------------------------------------------
 %% Internal Functions ------------------------------------------------
 %%--------------------------------------------------------------------
@@ -1339,6 +1400,8 @@ url(https, End, Config) ->
     ?TLS_URL_START ++ Host ++ ":" ++ integer_to_list(Port) ++ End;
 url(sim_http, End, Config) ->
     url(http, End, Config);
+url(http_internal, End, Config) ->
+    url(http, End, Config);
 url(sim_https, End, Config) ->
     url(https, End, Config).
 url(http, UserInfo, End, Config) ->
@@ -1358,19 +1421,28 @@ group_name(Config) ->
 
 server_start(sim_http, _) ->
     Inet = inet_version(),
-    ok = httpc:set_options([{ipfamily, Inet}]),
+    ok = httpc:set_options([{ipfamily, Inet},{unix_socket, undefined}]),
     {_Pid, Port} = http_test_lib:dummy_server(ip_comm, Inet, [{content_cb, ?MODULE}]),
     Port;
 
 server_start(sim_https, SslConfig) ->
     Inet = inet_version(),
-    ok = httpc:set_options([{ipfamily, Inet}]),
+    ok = httpc:set_options([{ipfamily, Inet},{unix_socket, undefined}]),
     {_Pid, Port} = http_test_lib:dummy_server(ssl, Inet, [{ssl, SslConfig}, {content_cb, ?MODULE}]),
+    Port;
+
+server_start(http_unix_socket, Config) ->
+    Inet = local,
+    Socket = proplists:get_value(unix_socket, Config),
+    ok = httpc:set_options([{ipfamily, Inet},{unix_socket, Socket}]),
+    {_Pid, Port} = http_test_lib:dummy_server(unix_socket, Inet, [{content_cb, ?MODULE},
+                                                                  {unix_socket, Socket}]),
     Port;
 
 server_start(_, HttpdConfig) ->
     {ok, Pid} = inets:start(httpd, HttpdConfig),
     Serv = inets:services_info(),
+    ok = httpc:set_options([{ipfamily, inet_version()},{unix_socket, undefined}]),
     {value, {_, _, Info}} = lists:keysearch(Pid, 2, Serv),
     proplists:get_value(port, Info).
 
@@ -1385,13 +1457,30 @@ server_config(http, Config) ->
      {mime_type, "text/plain"},
      {script_alias, {"/cgi-bin/", filename:join(ServerRoot, "cgi-bin") ++ "/"}}
     ];
-
+server_config(http_internal, Config) ->
+    ServerRoot = proplists:get_value(server_root, Config),
+    [{port, 0},
+     {server_name,"httpc_test"},
+     {server_root, ServerRoot},
+     {document_root, proplists:get_value(doc_root, Config)},
+     {bind_address, any},
+     {ipfamily, inet_version()},
+     {mime_type, "text/plain"},
+     {erl_script_alias, {"", [httpc_SUITE]}}
+    ];
 server_config(https, Config) ->
     [{socket_type, {essl, ssl_config(Config)}} | server_config(http, Config)];
 server_config(sim_https, Config) ->
     ssl_config(Config);
+server_config(http_unix_socket, _Config) ->
+    Socket = ?UNIX_SOCKET,
+    [{unix_socket, Socket}];
+
 server_config(_, _) ->
     [].
+
+esi_post(Sid, _Env, _Input) ->
+    mod_esi:deliver(Sid, ["OK"]).
 
 start_apps(https) ->
     inets_test_lib:start_apps([crypto, public_key, ssl]);
@@ -2131,6 +2220,19 @@ handle_uri(_,"/delay_close.html",_,_,Socket,_) ->
 handle_uri("HEAD",_,_,_,_,_) ->
     "HTTP/1.1 200 ok\r\n" ++
 	"Content-Length:0\r\n\r\n";
+handle_uri("PUT","/v1/kv/foo",_,_,_,_) ->
+    "HTTP/1.1 200 OK\r\n" ++
+        "Date: Tue, 20 Feb 2018 14:39:08 GMT\r\n" ++
+        "Content-Length: 5\r\n\r\n" ++
+        "Content-Type: application/json\r\n\r\n" ++
+        "true\n";
+handle_uri("GET","/v1/kv/foo",_,_,_,_) ->
+    "HTTP/1.1 200 OK\r\n" ++
+        "Date: Tue, 20 Feb 2018 14:39:08 GMT\r\n" ++
+        "Content-Length: 24\r\n" ++
+        "Content-Type: application/json\r\n\r\n" ++
+        "[{\"Value\": \"aGVsbG8=\"}]\n";
+
 handle_uri(_,_,_,_,_,DefaultResponse) ->
     DefaultResponse.
 

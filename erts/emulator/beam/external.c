@@ -711,8 +711,8 @@ erts_prepare_dist_ext(ErtsDistExternal *edep,
 
     erts_de_rlock(dep);
 
-    if (dep->status != ERTS_DE_SFLG_CONNECTED &&
-	dep->status != ERTS_DE_SFLG_PENDING) {
+    if (dep->state != ERTS_DE_STATE_CONNECTED &&
+	dep->state != ERTS_DE_STATE_PENDING) {
         erts_de_runlock(dep);
         return ERTS_PREP_DIST_EXT_CLOSED;
     }
@@ -1953,7 +1953,7 @@ static Eterm erts_term_to_binary_int(Process* p, Eterm Term, int level, Uint fla
 	    context_b = erts_create_magic_binary(sizeof(TTBContext),    \
                                                  ttb_context_destructor);   \
 	    context =  ERTS_MAGIC_BIN_DATA(context_b);			\
-	    memcpy(context,&c_buff,sizeof(TTBContext));			\
+	    sys_memcpy(context,&c_buff,sizeof(TTBContext));			\
 	}								\
     } while (0)
 
@@ -2032,23 +2032,14 @@ static Eterm erts_term_to_binary_int(Process* p, Eterm Term, int level, Uint fla
 		level = context->s.ec.level;
 		BUMP_REDS(p, (initial_reds - reds) / TERM_TO_BINARY_LOOP_FACTOR);
 		if (level == 0 || real_size < 6) { /* We are done */
-		    ProcBin* pb;
 		return_normal:
 		    context->s.ec.result_bin = NULL;
 		    context->alive = 0;
-		    pb = (ProcBin *) HAlloc(p, PROC_BIN_SIZE);
-		    pb->thing_word = HEADER_PROC_BIN;
-		    pb->size = real_size;
-		    pb->next = MSO(p).first;
-		    MSO(p).first = (struct erl_off_heap_header*)pb;
-		    pb->val = result_bin;
-		    pb->bytes = (byte*) result_bin->orig_bytes;
-		    pb->flags = 0;
-		    OH_OVERHEAD(&(MSO(p)), pb->size / sizeof(Eterm));
 		    if (context_b && erts_refc_read(&context_b->intern.refc,0) == 0) {
 			erts_bin_free(context_b);
 		    }
-		    return make_binary(pb);
+		    return erts_build_proc_bin(&MSO(p), HAlloc(p, PROC_BIN_SIZE),
+                                               result_bin);
 		}
 		/* Continue with compression... */
 		/* To make absolutely sure that zlib does not barf on a reallocated context, 
@@ -2105,16 +2096,7 @@ static Eterm erts_term_to_binary_int(Process* p, Eterm Term, int level, Uint fla
 			result_bin = erts_bin_realloc(context->s.cc.destination_bin,
 						      context->s.cc.dest_len+6);
 			context->s.cc.destination_bin = NULL;
-			pb = (ProcBin *) HAlloc(p, PROC_BIN_SIZE);
-			pb->thing_word = HEADER_PROC_BIN;
-			pb->size = context->s.cc.dest_len+6;
-			pb->next = MSO(p).first;
-			MSO(p).first = (struct erl_off_heap_header*)pb;
-			pb->val = result_bin;
 			ASSERT(erts_refc_read(&result_bin->intern.refc, 1));
-			pb->bytes = (byte*) result_bin->orig_bytes;
-			pb->flags = 0;
-			OH_OVERHEAD(&(MSO(p)), pb->size / sizeof(Eterm));
 			erts_bin_free(context->s.cc.result_bin);
 			context->s.cc.result_bin = NULL;
 			context->alive = 0;
@@ -2122,7 +2104,9 @@ static Eterm erts_term_to_binary_int(Process* p, Eterm Term, int level, Uint fla
 			if (context_b && erts_refc_read(&context_b->intern.refc,0) == 0) {
 			    erts_bin_free(context_b);
 			}
-			return make_binary(pb);
+			return erts_build_proc_bin(&MSO(p),
+						   HAlloc(p, PROC_BIN_SIZE),
+                                                   result_bin);
 		    }
 		default: /* Compression error, revert to uncompressed binary (still in 
 			    context) */
@@ -2889,6 +2873,8 @@ enc_term_int(TTBEncodeContext* ctx, ErtsAtomCacheMap *acmp, Eterm obj, byte* ep,
 		    ep[j] = 0;	/* Zero unused bits at end of binary */
 		    data_dst = ep;
 		    ep += j + 1;
+                    if (ctx)
+                        ctx->hopefull_flags |= DFLAG_BIT_BINARIES;
 		} else {
 		    /*
 		     * Bit-level binary, but the receiver doesn't support it.
@@ -2924,6 +2910,8 @@ enc_term_int(TTBEncodeContext* ctx, ErtsAtomCacheMap *acmp, Eterm obj, byte* ep,
 		    ep = enc_atom(acmp, exp->info.mfa.function, ep, dflags);
 		    ep = enc_term(acmp, make_small(exp->info.mfa.arity),
                                   ep, dflags, off_heap);
+                    if (ctx)
+                        ctx->hopefull_flags |= DFLAG_EXPORT_PTR_TAG;
 		} else {
 		    /* Tag, arity */
 		    *ep++ = SMALL_TUPLE_EXT;
@@ -3584,18 +3572,9 @@ dec_term_atom_common:
 		    *objp = make_binary(hb);
 		} else {
 		    Binary* dbin = erts_bin_nrml_alloc(n);
-		    ProcBin* pb;
-		    pb = (ProcBin *) hp;
+
+		    *objp = erts_build_proc_bin(factory->off_heap, hp, dbin);
 		    hp += PROC_BIN_SIZE;
-		    pb->thing_word = HEADER_PROC_BIN;
-		    pb->size = n;
-		    pb->next = factory->off_heap->first;
-		    factory->off_heap->first = (struct erl_off_heap_header*)pb;
-		    OH_OVERHEAD(factory->off_heap, pb->size / sizeof(Eterm));
-		    pb->val = dbin;
-		    pb->bytes = (byte*) dbin->orig_bytes;
-		    pb->flags = 0;
-		    *objp = make_binary(pb);
                     if (ctx) {
                         int n_limit = reds * B2T_MEMCPY_FACTOR;
                         if (n > n_limit) {
@@ -3635,18 +3614,9 @@ dec_term_atom_common:
                     ep += n;
 		} else {
 		    Binary* dbin = erts_bin_nrml_alloc(n);
-		    ProcBin* pb;
+		    Uint n_copy = n;
 
-		    pb = (ProcBin *) hp;
-		    pb->thing_word = HEADER_PROC_BIN;
-		    pb->size = n;
-		    pb->next = factory->off_heap->first;
-		    factory->off_heap->first = (struct erl_off_heap_header*)pb;
-		    OH_OVERHEAD(factory->off_heap, pb->size / sizeof(Eterm));
-		    pb->val = dbin;
-		    pb->bytes = (byte*) dbin->orig_bytes;
-		    pb->flags = 0;
-		    bin = make_binary(pb);
+		    bin = erts_build_proc_bin(factory->off_heap, hp, dbin);
 		    hp += PROC_BIN_SIZE;
                     if (ctx) {
                         int n_limit = reds * B2T_MEMCPY_FACTOR;
@@ -3654,15 +3624,15 @@ dec_term_atom_common:
                             ctx->state = B2TDecodeBinary;
                             ctx->u.dc.remaining_n = n - n_limit;
                             ctx->u.dc.remaining_bytes = dbin->orig_bytes + n_limit;
-                            n = n_limit;
+                            n_copy = n_limit;
                             reds = 0;
                         }
-                        else
+                        else {
                             reds -= n / B2T_MEMCPY_FACTOR;
+			}
                     }
-                    sys_memcpy(dbin->orig_bytes, ep, n);
-                    ep += n;
-                    n = pb->size;
+                    sys_memcpy(dbin->orig_bytes, ep, n_copy);
+                    ep += n_copy;
                 }
 
 		if (bitsize == 8 || n == 0) {
@@ -4763,11 +4733,13 @@ Sint transcode_dist_obuf(ErtsDistOutputBuf* ob,
     struct transcode_context* ctx = dep->transcode_ctx;
 
     if (!ctx) { /* first call for 'ob' */
-
-        if (~dflags & (DFLAG_BIT_BINARIES | DFLAG_EXPORT_PTR_TAG)) {
+	ASSERT(!(ob->hopefull_flags & ~(Uint)(DFLAG_BIT_BINARIES |
+					      DFLAG_EXPORT_PTR_TAG)));
+        if (~dflags & ob->hopefull_flags) {
             /*
-             * Receiver does not support bitstrings and/or export funs.
-             * We need to transcode control and message terms to use tuple fallbacks.
+             * Receiver does not support bitstrings and/or export funs
+             * and output buffer contains such message tags (hopefull_flags).
+             * Must transcode control and message terms to use tuple fallbacks.
              */
             ctx = erts_alloc(ERTS_ALC_T_DIST_TRANSCODE, sizeof(struct transcode_context));
             dep->transcode_ctx = ctx;
@@ -4794,7 +4766,7 @@ Sint transcode_dist_obuf(ErtsDistOutputBuf* ob,
                 ctx->state = TRANSCODE_ENC_CTL;
             }
         }
-        else {
+        else if (!(dflags & DFLAG_DIST_HDR_ATOM_CACHE)) {
             /*
              * No need for full transcoding, but primitive receiver (erl_/jinterface)
              * expects VERSION_MAGIC before both control and message terms.
@@ -4811,8 +4783,10 @@ Sint transcode_dist_obuf(ErtsDistOutputBuf* ob,
             *--(ob->extp) = VERSION_MAGIC;
             goto done;
         }
+        else
+            goto done;
     }
-    else {
+    else {  /* continue after yield */
         ASSERT(ctx->dbg_ob == ob);
     }
     ctx->b2t.reds = reds * B2T_BYTES_PER_REDUCTION;
@@ -4865,6 +4839,7 @@ Sint transcode_dist_obuf(ErtsDistOutputBuf* ob,
         ob->msg_start = ob->ext_endp;
         ctx->ttb.wstack.wstart = NULL;
         ctx->ttb.flags = dflags;
+        ctx->ttb.hopefull_flags = 0;
         ctx->ttb.level = 0;
 
         ctx->state = TRANSCODE_ENC_MSG;
@@ -4877,7 +4852,7 @@ Sint transcode_dist_obuf(ErtsDistOutputBuf* ob,
         reds /= TERM_TO_BINARY_LOOP_FACTOR;
 
         ASSERT(ob->ext_endp <= ob->alloc_endp);
-
+        ASSERT(!ctx->ttb.hopefull_flags);
     }
     transcode_free_ctx(dep);
 

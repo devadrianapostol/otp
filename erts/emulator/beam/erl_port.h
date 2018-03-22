@@ -1,7 +1,7 @@
 /*
  * %CopyrightBegin%
  *
- * Copyright Ericsson AB 2012-2017. All Rights Reserved.
+ * Copyright Ericsson AB 2012-2018. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -180,6 +180,7 @@ void erts_init_port_data(Port *);
 void erts_cleanup_port_data(Port *);
 Uint erts_port_data_size(Port *);
 ErlOffHeap *erts_port_data_offheap(Port *);
+Eterm erts_port_data_read(Port* prt);
 
 #define ERTS_PORT_GET_CONNECTED(PRT) \
     ((Eterm) erts_atomic_read_nob(&(PRT)->connected))
@@ -195,26 +196,52 @@ struct erl_drv_port_data_lock {
     Port *prt;
 };
 
+ERTS_GLB_INLINE void erts_init_runq_port(Port *prt, ErtsRunQueue *runq);
+ERTS_GLB_INLINE void erts_set_runq_port(Port *prt, ErtsRunQueue *runq);
+ERTS_GLB_INLINE ErtsRunQueue *erts_get_runq_port(Port *prt);
 ERTS_GLB_INLINE ErtsRunQueue *erts_port_runq(Port *prt);
 
 #if ERTS_GLB_INLINE_INCL_FUNC_DEF
+
+ERTS_GLB_INLINE void
+erts_init_runq_port(Port *prt, ErtsRunQueue *runq)
+{
+    if (!runq)
+        ERTS_INTERNAL_ERROR("Missing run-queue");
+    erts_atomic_init_nob(&prt->run_queue, (erts_aint_t) runq);
+}
+
+ERTS_GLB_INLINE void
+erts_set_runq_port(Port *prt, ErtsRunQueue *runq)
+{
+    if (!runq)
+        ERTS_INTERNAL_ERROR("Missing run-queue");
+    erts_atomic_set_nob(&prt->run_queue, (erts_aint_t) runq);
+}
+
+ERTS_GLB_INLINE ErtsRunQueue *
+erts_get_runq_port(Port *prt)
+{
+    ErtsRunQueue *runq;
+    runq = (ErtsRunQueue *) erts_atomic_read_nob(&prt->run_queue);
+    if (!runq)
+        ERTS_INTERNAL_ERROR("Missing run-queue");
+    return runq;
+}
+
 
 ERTS_GLB_INLINE ErtsRunQueue *
 erts_port_runq(Port *prt)
 {
     ErtsRunQueue *rq1, *rq2;
-    rq1 = (ErtsRunQueue *) erts_atomic_read_nob(&prt->run_queue);
-    if (!rq1)
-	return NULL;
+    rq1 = erts_get_runq_port(prt);
     while (1) {
 	erts_runq_lock(rq1);
-	rq2 = (ErtsRunQueue *) erts_atomic_read_nob(&prt->run_queue);
+	rq2 = erts_get_runq_port(prt);
 	if (rq1 == rq2)
 	    return rq1;
 	erts_runq_unlock(rq1);
 	rq1 = rq2;
-	if (!rq1)
-	    return NULL;
     }
 }
 
@@ -346,7 +373,7 @@ Eterm erts_request_io_bytes(Process *c_p);
 
 void print_port_info(Port *, fmtfn_t, void *);
 void erts_port_free(Port *);
-void erts_fire_port_monitor(Port *prt, Eterm ref);
+void erts_fire_port_monitor(Port *prt, ErtsMonitor *tmon);
 int erts_port_handle_xports(Port *);
 
 #if defined(ERTS_ENABLE_LOCK_CHECK)
@@ -860,20 +887,20 @@ struct ErtsProc2PortSigData_ {
 	    Eterm item;
 	} info;
 	struct {
-	    Eterm port;
-	    Eterm to;
+            Eterm port_id;
+	    ErtsLink *lnk;
 	} link;
 	struct {
-	    Eterm from;
+            Eterm port_id;
+	    ErtsLink *lnk;
 	} unlink;
         struct {
-            Eterm origin;   /* who receives monitor event, pid */
-            Eterm name;     /* either name for named monitor, or port id */
+            Eterm port_id;
+            ErtsMonitor *mon;
         } monitor;
         struct {
-            Eterm origin;   /* who is at the other end of the monitor, pid */
-            Eterm name;     /* port id */
-            Uint32 ref[ERTS_MAX_REF_NUMBERS]; /* box contents of a ref */
+            Eterm port_id;
+            ErtsMonitor *mon;
         } demonitor;
     } u;
 } ;
@@ -919,7 +946,6 @@ typedef int (*ErtsProc2PortSigCallback)(Port *,
 
 typedef enum {
     ERTS_PORT_OP_BADARG,
-    ERTS_PORT_OP_CALLER_EXIT,
     ERTS_PORT_OP_BUSY,
     ERTS_PORT_OP_BUSY_SCHEDULED,
     ERTS_PORT_OP_SCHEDULED,
@@ -955,32 +981,13 @@ ErtsPortOpResult erts_port_command(Process *, int, Port *, Eterm, Eterm *);
 ErtsPortOpResult erts_port_output(Process *, int, Port *, Eterm, Eterm, Eterm *);
 ErtsPortOpResult erts_port_exit(Process *, int, Port *, Eterm, Eterm, Eterm *);
 ErtsPortOpResult erts_port_connect(Process *, int, Port *, Eterm, Eterm, Eterm *);
-ErtsPortOpResult erts_port_link(Process *, Port *, Eterm, Eterm *);
-ErtsPortOpResult erts_port_unlink(Process *, Port *, Eterm, Eterm *);
+ErtsPortOpResult erts_port_link(Process *, Port *, ErtsLink *, Eterm *);
+ErtsPortOpResult erts_port_unlink(Process *, Port *, ErtsLink *, Eterm *);
 ErtsPortOpResult erts_port_control(Process *, Port *, unsigned int, Eterm, Eterm *);
 ErtsPortOpResult erts_port_call(Process *, Port *, unsigned int, Eterm, Eterm *);
 ErtsPortOpResult erts_port_info(Process *, Port *, Eterm, Eterm *);
-
-/* Creates monitor between Origin and Target. Ref must be initialized to
- * a reference (ref may be rewritten to be used to serve additionally as a
- * signal id). Name is atom if user monitors port by name or NIL */
-ErtsPortOpResult erts_port_monitor(Process *origin, Port *target, Eterm name,
-                                   Eterm *ref);
-
-typedef enum {
-    /* Normal demonitor rules apply with locking and reductions bump */
-    ERTS_PORT_DEMONITOR_NORMAL = 1,
-    /* Relaxed demonitor rules when process is about to die, which means that
-     * pid lookup won't work, locks won't work, no reductions bump. */
-    ERTS_PORT_DEMONITOR_ORIGIN_ON_DEATHBED = 2,
-} ErtsDemonitorMode;
-
-/* Removes monitor between origin and target, identified by ref.
- * origin_is_dying can be 0 (false, normal locking rules and reductions bump
- * apply) or 1 (true, in case when we avoid origin locking) */
-ErtsPortOpResult erts_port_demonitor(Process *origin, ErtsDemonitorMode mode,
-                                    Port *target, Eterm ref,
-                                    Eterm *trap_ref);
+ErtsPortOpResult erts_port_monitor(Process *, Port *, ErtsMonitor *);
+ErtsPortOpResult erts_port_demonitor(Process *, Port *, ErtsMonitor *);
 /* defined in erl_bif_port.c */
 Port *erts_sig_lookup_port(Process *c_p, Eterm id_or_name);
 

@@ -1088,6 +1088,12 @@ resolve_inst({get_map_elements,Args0},_,_,_) ->
 
 resolve_inst({build_stacktrace,[]},_,_,_) ->
     build_stacktrace;
+resolve_inst({raw_raise,[]},_,_,_) ->
+    raw_raise;
+resolve_inst({get_hd,[Src,Dst]},_,_,_) ->
+    {get_hd,Src,Dst};
+resolve_inst({get_tl,[Src,Dst]},_,_,_) ->
+    {get_tl,Src,Dst};
 
 %%
 %% Catches instructions that are not yet handled.

@@ -564,7 +564,7 @@ display_info(Pid) ->
 			   Other
 		   end,
 	    Reds = fetch(reductions, Info),
-	    LM = length(fetch(messages, Info)),
+	    LM = fetch(message_queue_len, Info),
 	    HS = fetch(heap_size, Info),
 	    SS = fetch(stack_size, Info),
 	    iformat(w(Pid), mfa_string(Call),
@@ -886,7 +886,7 @@ portinfo(Id) ->
 procline(Name, Info, Pid) ->
     Call = initial_call(Info),
     Reds  = fetch(reductions, Info),
-    LM = length(fetch(messages, Info)),
+    LM = fetch(message_queue_len, Info),
     procformat(io_lib:format("~tw",[Name]),
 	       io_lib:format("~w",[Pid]),
 	       io_lib:format("~ts",[mfa_string(Call)]),
@@ -1034,8 +1034,8 @@ appcall(App, M, F, Args) ->
     try
 	apply(M, F, Args)
     catch
-	error:undef ->
-	    case erlang:get_stacktrace() of
+	error:undef:S ->
+	    case S of
 		[{M,F,Args,_}|_] ->
 		    Arity = length(Args),
 		    io:format("Call to ~w:~w/~w in application ~w failed.\n",

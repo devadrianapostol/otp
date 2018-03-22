@@ -182,6 +182,9 @@ get_list r x y
 get_list r y r
 get_list r x r
 
+get_hd xy xy
+get_tl xy xy
+
 # Old-style catch.
 catch y f
 catch_end y
@@ -1410,7 +1413,7 @@ has_map_fields Fail Src Size Rest=* => \
 
 ## Transform get_map_elements(s) #{ K1 := V1, K2 := V2 }
 
-get_map_elements Fail Src=xy Size=u==2 Rest=* => \
+get_map_elements Fail Src Size=u==2 Rest=* => \
     gen_get_map_element(Fail, Src, Size, Rest)
 get_map_elements Fail Src Size Rest=* | map_key_sort(Size, Rest) => \
    gen_get_map_elements(Fail, Src, Size, Rest)
@@ -1420,8 +1423,12 @@ i_get_map_elements f? s I
 i_get_map_element Fail Src=xy Key=y Dst => \
     move Key x | i_get_map_element Fail Src x Dst
 
+i_get_map_element_hash Fail Src=c Key Hash Dst => \
+    move Src x | i_get_map_element_hash Fail x Key Hash Dst
 i_get_map_element_hash f? xy c I xy
 
+i_get_map_element Fail Src=c Key Dst => \
+    move Src x | i_get_map_element Fail x Key Dst
 i_get_map_element f? xy x xy
 
 #
@@ -1584,3 +1591,4 @@ i_recv_set
 #
 
 build_stacktrace
+raw_raise

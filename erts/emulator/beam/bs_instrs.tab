@@ -919,9 +919,23 @@ i_bs_get_integer(Fail, Live, FlagsAndUnit, Ms, Sz, Dst) {
 }
 
 i_bs_get_utf8(Ctx, Fail, Dst) {
+    Eterm result;
     ErlBinMatchBuffer* mb = ms_matchbuffer($Ctx);
-    Eterm result = erts_bs_get_utf8(mb);
 
+    if (mb->size - mb->offset < 8) {
+        $FAIL($Fail);
+    }
+    if (BIT_OFFSET(mb->offset) != 0) {
+        result = erts_bs_get_utf8(mb);
+    } else {
+        byte b = mb->base[BYTE_OFFSET(mb->offset)];
+        if (b < 128) {
+            result = make_small(b);
+            mb->offset += 8;
+        } else {
+            result = erts_bs_get_utf8(mb);
+        }
+    }
     if (is_non_value(result)) {
         $FAIL($Fail);
     }
@@ -976,6 +990,9 @@ ctx_to_bin.execute() {
     Uint hole_size;
     Uint orig = mb->orig;
     ErlSubBin* sb = (ErlSubBin *) boxed_val(context);
+    /* Since we're going to overwrite the match state with the result, an
+     * ErlBinMatchState must be at least as large as an ErlSubBin. */
+    ERTS_CT_ASSERT(sizeof(ErlSubBin) <= sizeof(ErlBinMatchState));
     hole_size = 1 + header_arity(sb->thing_word) - ERL_SUB_BIN_SIZE;
     sb->thing_word = HEADER_SUB_BIN;
     sb->size = BYTE_OFFSET(size);

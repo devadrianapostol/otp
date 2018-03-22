@@ -268,7 +268,7 @@ default(server) ->
            },
 
       {shell, def} =>
-          #{default => {shell, start, []},
+          #{default => ?DEFAULT_SHELL,
             chk => fun({M,F,A}) -> is_atom(M) andalso is_atom(F) andalso is_list(A);
                       (V) -> check_function1(V) orelse check_function2(V)
                    end,
@@ -434,6 +434,12 @@ default(client) ->
            },
 
       {user_interaction, def} =>
+          #{default => true,
+            chk => fun erlang:is_boolean/1,
+            class => user_options
+           },
+
+      {save_accepted_host, def} =>
           #{default => true,
             chk => fun erlang:is_boolean/1,
             class => user_options

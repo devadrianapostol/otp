@@ -219,13 +219,15 @@ expand_opt(report, Os) ->
 expand_opt(return, Os) ->
     [return_errors,return_warnings|Os];
 expand_opt(r16, Os) ->
-    [no_record_opt,no_utf8_atoms|Os];
+    [no_get_hd_tl,no_record_opt,no_utf8_atoms|Os];
 expand_opt(r17, Os) ->
-    [no_record_opt,no_utf8_atoms|Os];
+    [no_get_hd_tl,no_record_opt,no_utf8_atoms|Os];
 expand_opt(r18, Os) ->
-    [no_record_opt,no_utf8_atoms|Os];
+    [no_get_hd_tl,no_record_opt,no_utf8_atoms|Os];
 expand_opt(r19, Os) ->
-    [no_record_opt,no_utf8_atoms|Os];
+    [no_get_hd_tl,no_record_opt,no_utf8_atoms|Os];
+expand_opt(r20, Os) ->
+    [no_get_hd_tl,no_record_opt,no_utf8_atoms|Os];
 expand_opt({debug_info_key,_}=O, Os) ->
     [encrypt_debug_info,O|Os];
 expand_opt(no_float_opt, Os) ->
@@ -775,6 +777,8 @@ asm_passes() ->
 	 {iff,drecv,{listing,"recv"}},
 	 {unless,no_record_opt,{pass,beam_record}},
 	 {iff,drecord,{listing,"record"}},
+         {unless,no_blk2,?pass(block2)},
+	 {iff,dblk2,{listing,"block2"}},
 	 {unless,no_stack_trimming,{pass,beam_trim}},
 	 {iff,dtrim,{listing,"trim"}},
 	 {pass,beam_flatten}]},
@@ -1349,6 +1353,10 @@ v3_kernel(Code0, #compile{options=Opts,warnings=Ws0}=St) ->
 	    %% warnings. Ignore any such warnings.
 	    {ok,Code,St}
     end.
+
+block2(Code0, #compile{options=Opts}=St) ->
+    {ok,Code} = beam_block:module(Code0, [no_blockify|Opts]),
+    {ok,Code,St}.
 
 test_old_inliner(#compile{options=Opts}) ->
     %% The point of this test is to avoid loading the old inliner

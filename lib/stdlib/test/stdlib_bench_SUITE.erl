@@ -1,7 +1,7 @@
 %%
 %% %CopyrightBegin%
 %%
-%% Copyright Ericsson AB 2012-2017. All Rights Reserved.
+%% Copyright Ericsson AB 2012-2018. All Rights Reserved.
 %%
 %% Licensed under the Apache License, Version 2.0 (the "License");
 %% you may not use this file except in compliance with the License.
@@ -30,7 +30,8 @@ suite() -> [{ct_hooks,[{ts_install_cth,[{nodenames,2}]}]}].
 
 all() ->
     [{group,unicode},{group,base64},
-     {group,gen_server},{group,gen_server_comparison}].
+     {group,gen_server},{group,gen_statem},
+     {group,gen_server_comparison},{group,gen_statem_comparison}].
 
 groups() ->
     [{unicode,[{repeat,5}],
@@ -44,20 +45,39 @@ groups() ->
        encode_list, encode_list_to_string,
        mime_binary_decode, mime_binary_decode_to_string,
        mime_list_decode, mime_list_decode_to_string]},
-     {gen_server, [{repeat,5}],
-      [simple, simple_timer, simple_mon, simple_timer_mon,
-       generic, generic_timer]},
+     {gen_server, [{repeat,5}], cases(gen_server)},
+     {gen_statem, [{repeat,3}], cases(gen_statem)},
      {gen_server_comparison, [],
       [single_small, single_medium, single_big,
        sched_small, sched_medium, sched_big,
-       multi_small, multi_medium, multi_big]}].
+       multi_small, multi_medium, multi_big]},
+     {gen_statem_comparison, [],
+      [single_small, single_big,
+       sched_small, sched_big,
+       multi_small, multi_big]}].
 
-init_per_group(GroupName, Config) when GroupName =:= gen_server;
-                                       GroupName =:= gen_server_comparison ->
-    DataDir = ?config(data_dir, Config),
-    Files = filelib:wildcard(filename:join(DataDir, "{simple,generic}*.erl")),
-    _ = [{ok, _} = compile:file(File) || File <- Files],
-    Config;
+cases(gen_server) ->
+      [simple, simple_timer, simple_mon, simple_timer_mon,
+       generic, generic_timer];
+cases(gen_statem) ->
+    [generic, generic_fsm, generic_fsm_transit,
+     generic_statem, generic_statem_transit,
+     generic_statem_complex].
+
+init_per_group(gen_server, Config) ->
+    compile_servers(Config),
+    [{benchmark_suite,"stdlib_gen_server"}|Config];
+init_per_group(gen_statem, Config) ->
+    compile_servers(Config),
+    [{benchmark_suite,"stdlib_gen_statem"}|Config];
+init_per_group(gen_server_comparison, Config) ->
+    compile_servers(Config),
+    [{cases,cases(gen_server)},
+     {benchmark_suite,"stdlib_gen_server"}|Config];
+init_per_group(gen_statem_comparison, Config) ->
+    compile_servers(Config),
+    [{cases,cases(gen_statem)},
+     {benchmark_suite,"stdlib_gen_statem"}|Config];
 init_per_group(_GroupName, Config) ->
     Config.
 
@@ -77,23 +97,33 @@ end_per_testcase(_Func, _Conf) ->
     ok.
 
 
+compile_servers(Config) ->
+    DataDir = ?config(data_dir, Config),
+    Files = filelib:wildcard(filename:join(DataDir, "{simple,generic}*.erl")),
+    _ = [{ok, _} = compile:file(File) || File <- Files],
+    ok.
+
+comment(Value) ->
+    C = lists:flatten(io_lib:format("~p", [Value])),
+    {comment, C}.
+
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 -define(REPEAT_NORM, 5).
 
 norm_nfc_list(Config) ->
     Bin = norm_data(Config),
     {_N, Mean, _Stddev, Res} = unicode_util_SUITE:time_count(nfc, list, Bin, ?REPEAT_NORM),
-    report(1000.0*Res / Mean).
+    comment(report(1000.0*Res / Mean)).
 
 norm_nfc_deep_l(Config) ->
     Bin = norm_data(Config),
     {_N, Mean, _Stddev, Res} = unicode_util_SUITE:time_count(nfc, deep_l, Bin, ?REPEAT_NORM),
-    report(1000.0*Res / Mean).
+    comment(report(1000.0*Res / Mean)).
 
 norm_nfc_binary(Config) ->
     Bin = norm_data(Config),
     {_N, Mean, _Stddev, Res} = unicode_util_SUITE:time_count(nfc, binary, Bin, ?REPEAT_NORM),
-    report(1000.0*Res / Mean).
+    comment(report(1000.0*Res / Mean)).
 
 
 string_lexemes_list(Config) ->
@@ -102,7 +132,7 @@ string_lexemes_list(Config) ->
     Bin = norm_data(Config),
     Fun = fun(Str) -> string:nth_lexeme(Str, 200000, [$;,$\n,$\r]), 200000 end,
     {_N, Mean, _Stddev, Res} = string_SUITE:time_func(Fun, list, Bin, 15),
-    report(1000.0*Res / Mean).
+    comment(report(1000.0*Res / Mean)).
 
 string_lexemes_binary(Config) ->
     %% Use nth_lexeme instead of lexemes to avoid building a result of
@@ -110,7 +140,7 @@ string_lexemes_binary(Config) ->
     Bin = norm_data(Config),
     Fun = fun(Str) -> string:nth_lexeme(Str, 200000, [$;,$\n,$\r]), 200000 end,
     {_N, Mean, _Stddev, Res} = string_SUITE:time_func(Fun, binary, Bin, ?REPEAT_NORM),
-    report(1000.0*Res / Mean).
+    comment(report(1000.0*Res / Mean)).
 
 %%%
 report(Tps) ->
@@ -128,40 +158,40 @@ norm_data(Config) ->
 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 
 decode_binary(_Config) ->
-    test(decode, encoded_binary()).
+    comment(test(decode, encoded_binary())).
 
 decode_binary_to_string(_Config) ->
-    test(decode_to_string, encoded_binary()).
+    comment(test(decode_to_string, encoded_binary())).
 
 decode_list(_Config) ->
-    test(decode, encoded_list()).
+    comment(test(decode, encoded_list())).
 
 decode_list_to_string(_Config) ->
-    test(decode_to_string, encoded_list()).
+    comment(test(decode_to_string, encoded_list())).
 
 encode_binary(_Config) ->
-    test(encode, binary()).
+    comment(test(encode, binary())).
 
 encode_binary_to_string(_Config) ->
-    test(encode_to_string, binary()).
+    comment(test(encode_to_string, binary())).
 
 encode_list(_Config) ->
-    test(encode, list()).
+    comment(test(encode, list())).
 
 encode_list_to_string(_Config) ->
-    test(encode_to_string, list()).
+    comment(test(encode_to_string, list())).
 
 mime_binary_decode(_Config) ->
-    test(mime_decode, encoded_binary()).
+    comment(test(mime_decode, encoded_binary())).
 
 mime_binary_decode_to_string(_Config) ->
-    test(mime_decode_to_string, encoded_binary()).
+    comment(test(mime_decode_to_string, encoded_binary())).
 
 mime_list_decode(_Config) ->
-    test(mime_decode, encoded_list()).
+    comment(test(mime_decode, encoded_list())).
 
 mime_list_decode_to_string(_Config) ->
-    test(mime_decode_to_string, encoded_list()).
+    comment(test(mime_decode_to_string, encoded_list())).
 
 -define(SIZE, 10000).
 -define(N, 1000).
@@ -223,152 +253,212 @@ mbb(N, Acc) ->
     lists:reverse(Acc, B).
 
 simple(Config) when is_list(Config) ->
-    do_tests(simple, single_small).
+    comment(do_tests(simple, single_small, Config)).
 
 simple_timer(Config) when is_list(Config) ->
-    do_tests(simple_timer, single_small).
+    comment(do_tests(simple_timer, single_small, Config)).
 
 simple_mon(Config) when is_list(Config) ->
-    do_tests(simple_mon, single_small).
+    comment(do_tests(simple_mon, single_small, Config)).
 
 simple_timer_mon(Config) when is_list(Config) ->
-    do_tests(simple_timer_mon, single_small).
+    comment(do_tests(simple_timer_mon, single_small, Config)).
 
 generic(Config) when is_list(Config) ->
-    do_tests(generic, single_small).
+    comment(do_tests(generic, single_small, Config)).
 
 generic_timer(Config) when is_list(Config) ->
-    do_tests(generic_timer, single_small).
+    comment(do_tests(generic_timer, single_small, Config)).
+
+generic_statem(Config) when is_list(Config) ->
+    comment(do_tests(generic_statem, single_small, Config)).
+
+generic_statem_transit(Config) when is_list(Config) ->
+    comment(do_tests(generic_statem_transit, single_small, Config)).
+
+generic_statem_complex(Config) when is_list(Config) ->
+    comment(do_tests(generic_statem_complex, single_small, Config)).
+
+generic_fsm(Config) when is_list(Config) ->
+    comment(do_tests(generic_fsm, single_small, Config)).
+
+generic_fsm_transit(Config) when is_list(Config) ->
+    comment(do_tests(generic_fsm_transit, single_small, Config)).
 
 single_small(Config) when is_list(Config) ->
-    comparison(single_small).
+    comparison(?config(cases, Config), single_small, Config).
 
 single_medium(Config) when is_list(Config) ->
-    comparison(single_medium).
+    comparison(?config(cases, Config), single_medium, Config).
 
 single_big(Config) when is_list(Config) ->
-    comparison(single_big).
+    comparison(?config(cases, Config), single_big, Config).
 
 sched_small(Config) when is_list(Config) ->
-    comparison(sched_small).
+    comparison(?config(cases, Config), sched_small, Config).
 
 sched_medium(Config) when is_list(Config) ->
-    comparison(sched_medium).
+    comparison(?config(cases, Config), sched_medium, Config).
 
 sched_big(Config) when is_list(Config) ->
-    comparison(sched_big).
+    comparison(?config(cases, Config), sched_big, Config).
 
 multi_small(Config) when is_list(Config) ->
-    comparison(multi_small).
+    comparison(?config(cases, Config), multi_small, Config).
 
 multi_medium(Config) when is_list(Config) ->
-    comparison(multi_medium).
+    comparison(?config(cases, Config), multi_medium, Config).
 
 multi_big(Config) when is_list(Config) ->
-    comparison(multi_big).
+    comparison(?config(cases, Config), multi_big, Config).
 
-comparison(Kind) ->
-    Simple0 = do_tests(simple, Kind),
-    SimpleTimer0 = do_tests(simple_timer, Kind),
-    SimpleMon0 = do_tests(simple_mon, Kind),
-    SimpleTimerMon0 = do_tests(simple_timer_mon, Kind),
-    Generic0 = do_tests(generic, Kind),
-    GenericTimer0 = do_tests(generic_timer, Kind),
-    %% Normalize
-    Simple = norm(Simple0, Simple0),
-    SimpleTimer = norm(SimpleTimer0, Simple0),
-    SimpleMon = norm(SimpleMon0, Simple0),
-    SimpleTimerMon = norm(SimpleTimerMon0, Simple0),
-    Generic = norm(Generic0, Simple0),
-    GenericTimer = norm(GenericTimer0, Simple0),
-    {Parallelism, _N, Message} = bench_params(Kind),
+comparison(Cases, Kind, Config) ->
+    Cases = ?config(cases, Config),
+    [RefResult|_] = Results =
+        [do_tests(Case, Kind, Config) || Case <- Cases],
+    Normalized = [norm(Result, RefResult) || Result <- Results],
+    {Parallelism, Message} = bench_params(Kind),
     Wordsize = erlang:system_info(wordsize),
     MSize = Wordsize * erts_debug:flat_size(Message),
     What = io_lib:format("#parallel gen_server instances: ~.4w, "
                          "message flat size: ~.5w bytes",
                          [Parallelism, MSize]),
-    C = io_lib:format("~s: "
-                      "Simple: ~s Simple+Timer: ~s "
-                      "Simple+Monitor: ~s Simple+Timer+Monitor: ~s "
-                      "Generic: ~s Generic+Timer: ~s",
-                     [What, Simple, SimpleTimer, SimpleMon, SimpleTimerMon,
-                     Generic, GenericTimer]),
+    Format =
+        lists:flatten(
+          ["~s: "] ++
+              [[atom_to_list(Case),": ~s "] || Case <- Cases]),
+    C = lists:flatten(io_lib:format(Format, [What] ++ Normalized)),
     {comment, C}.
 
 norm(T, Ref) ->
-    io_lib:format("~.2f", [T/Ref]).
+    try Ref / T of
+        Norm ->
+            io_lib:format("~.2f", [Norm])
+    catch error:badarith ->
+            "---"
+    end.
 
-do_tests(Test, ParamSet) ->
+-define(MAX_TIME_SECS, 3).   % s
+-define(MAX_TIME, 1000 * ?MAX_TIME_SECS). % ms
+-define(CALLS_PER_LOOP, 5).
+
+do_tests(Test, ParamSet, Config) ->
+    BenchmarkSuite = ?config(benchmark_suite, Config),
     {Client, ServerMod} = bench(Test),
-    {Parallelism, N, Message} = bench_params(ParamSet),
-    Fun = create_clients(N, Message, ServerMod, Client, Parallelism),
-    Time = run_test(Fun),
-    TimesPerTest = 5,
-    PerSecond = Parallelism * TimesPerTest * round((1000 * N) / Time),
-    ct_event:notify(#event{name = benchmark_data,
-                           data = [{suite,"stdlib_gen_server"},
-                                   {value,PerSecond}]}),
-    Time.
+    {Parallelism, Message} = bench_params(ParamSet),
+    Fun = create_clients(Message, ServerMod, Client, Parallelism),
+    {TotalLoops, AllPidTime} = run_test(Fun),
+    try ?CALLS_PER_LOOP * round((1000 * TotalLoops) / AllPidTime) of
+        PerSecond ->
+            ct_event:notify(
+              #event{
+                 name = benchmark_data,
+                 data = [{suite,BenchmarkSuite},{value,PerSecond}]}),
+            PerSecond
+    catch error:badarith ->
+            "Time measurement is not working"
+    end.
 
-simple_client(0, _, _P) ->
-    ok;
+-define(COUNTER, n).
+
 simple_client(N, M, P) ->
+    put(?COUNTER, N),
     _ = simple_server:reply(P, M),
     _ = simple_server:reply(P, M),
     _ = simple_server:reply(P, M),
     _ = simple_server:reply(P, M),
     _ = simple_server:reply(P, M),
-    simple_client(N-1, M, P).
+    simple_client(N+1, M, P).
 
-simple_client_timer(0, _, _P) ->
-    ok;
 simple_client_timer(N, M, P) ->
+    put(?COUNTER, N),
     _ = simple_server_timer:reply(P, M),
     _ = simple_server_timer:reply(P, M),
     _ = simple_server_timer:reply(P, M),
     _ = simple_server_timer:reply(P, M),
     _ = simple_server_timer:reply(P, M),
-    simple_client_timer(N-1, M, P).
+    simple_client_timer(N+1, M, P).
 
-simple_client_mon(0, _, _P) ->
-    ok;
 simple_client_mon(N, M, P) ->
+    put(?COUNTER, N),
     _ = simple_server_mon:reply(P, M),
     _ = simple_server_mon:reply(P, M),
     _ = simple_server_mon:reply(P, M),
     _ = simple_server_mon:reply(P, M),
     _ = simple_server_mon:reply(P, M),
-    simple_client_mon(N-1, M, P).
+    simple_client_mon(N+1, M, P).
 
-simple_client_timer_mon(0, _, _P) ->
-    ok;
 simple_client_timer_mon(N, M, P) ->
+    put(?COUNTER, N),
     _ = simple_server_timer_mon:reply(P, M),
     _ = simple_server_timer_mon:reply(P, M),
     _ = simple_server_timer_mon:reply(P, M),
     _ = simple_server_timer_mon:reply(P, M),
     _ = simple_server_timer_mon:reply(P, M),
-    simple_client_timer_mon(N-1, M, P).
+    simple_client_timer_mon(N+1, M, P).
 
-generic_client(0, _, _P) ->
-    ok;
 generic_client(N, M, P) ->
+    put(?COUNTER, N),
     _ = generic_server:reply(P, M),
     _ = generic_server:reply(P, M),
     _ = generic_server:reply(P, M),
     _ = generic_server:reply(P, M),
     _ = generic_server:reply(P, M),
-    generic_client(N-1, M, P).
+    generic_client(N+1, M, P).
 
-generic_timer_client(0, _, _P) ->
-    ok;
 generic_timer_client(N, M, P) ->
+    put(?COUNTER, N),
     _ = generic_server_timer:reply(P, M),
     _ = generic_server_timer:reply(P, M),
     _ = generic_server_timer:reply(P, M),
     _ = generic_server_timer:reply(P, M),
     _ = generic_server_timer:reply(P, M),
-    generic_timer_client(N-1, M, P).
+    generic_timer_client(N+1, M, P).
+
+generic_statem_client(N, M, P) ->
+    put(?COUNTER, N),
+    _ = generic_statem:reply(P, M),
+    _ = generic_statem:reply(P, M),
+    _ = generic_statem:reply(P, M),
+    _ = generic_statem:reply(P, M),
+    _ = generic_statem:reply(P, M),
+    generic_statem_client(N+1, M, P).
+
+generic_statem_transit_client(N, M, P) ->
+    put(?COUNTER, N),
+    _ = generic_statem:transit(P, M),
+    _ = generic_statem:transit(P, M),
+    _ = generic_statem:transit(P, M),
+    _ = generic_statem:transit(P, M),
+    _ = generic_statem:transit(P, M),
+    generic_statem_transit_client(N+1, M, P).
+
+generic_statem_complex_client(N, M, P) ->
+    put(?COUNTER, N),
+    _ = generic_statem:reply(P, M),
+    _ = generic_statem:reply(P, M),
+    _ = generic_statem:reply(P, M),
+    _ = generic_statem:reply(P, M),
+    _ = generic_statem:reply(P, M),
+    generic_statem_complex_client(N+1, M, P).
+
+generic_fsm_client(N, M, P) ->
+    put(?COUNTER, N),
+    _ = generic_fsm:reply(P, M),
+    _ = generic_fsm:reply(P, M),
+    _ = generic_fsm:reply(P, M),
+    _ = generic_fsm:reply(P, M),
+    _ = generic_fsm:reply(P, M),
+    generic_fsm_client(N+1, M, P).
+
+generic_fsm_transit_client(N, M, P) ->
+    put(?COUNTER, N),
+    _ = generic_fsm:transit(P, M),
+    _ = generic_fsm:transit(P, M),
+    _ = generic_fsm:transit(P, M),
+    _ = generic_fsm:transit(P, M),
+    _ = generic_fsm:transit(P, M),
+    generic_fsm_transit_client(N+1, M, P).
 
 bench(simple) ->
     {fun simple_client/3, simple_server};
@@ -381,18 +471,28 @@ bench(simple_timer_mon) ->
 bench(generic) ->
     {fun generic_client/3, generic_server};
 bench(generic_timer) ->
-    {fun generic_timer_client/3, generic_server_timer}.
+    {fun generic_timer_client/3, generic_server_timer};
+bench(generic_statem) ->
+    {fun generic_statem_client/3, generic_statem};
+bench(generic_statem_transit) ->
+    {fun generic_statem_transit_client/3, generic_statem};
+bench(generic_statem_complex) ->
+    {fun generic_statem_complex_client/3, generic_statem_complex};
+bench(generic_fsm) ->
+    {fun generic_fsm_client/3, generic_fsm};
+bench(generic_fsm_transit) ->
+    {fun generic_fsm_transit_client/3, generic_fsm}.
 
-%% -> {Parallelism, NumberOfMessages, MessageTerm}
-bench_params(single_small) -> {1, 700000, small()};
-bench_params(single_medium) -> {1, 350000, medium()};
-bench_params(single_big) -> {1, 70000, big()};
-bench_params(sched_small)  -> {parallelism(), 200000, small()};
-bench_params(sched_medium)  -> {parallelism(), 100000, medium()};
-bench_params(sched_big)  -> {parallelism(), 20000, big()};
-bench_params(multi_small)  -> {400, 2000, small()};
-bench_params(multi_medium)  -> {400, 1000, medium()};
-bench_params(multi_big)  -> {400, 200, big()}.
+%% -> {Parallelism, MessageTerm}
+bench_params(single_small) -> {1, small()};
+bench_params(single_medium) -> {1, medium()};
+bench_params(single_big) -> {1, big()};
+bench_params(sched_small)  -> {parallelism(), small()};
+bench_params(sched_medium)  -> {parallelism(), medium()};
+bench_params(sched_big)  -> {parallelism(), big()};
+bench_params(multi_small)  -> {400, small()};
+bench_params(multi_medium)  -> {400, medium()};
+bench_params(multi_big)  -> {400, big()}.
 
 small() ->
     small.
@@ -409,19 +509,38 @@ parallelism() ->
         _ -> 1
     end.
 
-create_clients(N, M, ServerMod, Client, Parallel) ->
+create_clients(M, ServerMod, Client, Parallel) ->
     fun() ->
             State = term,
             ServerPid = ServerMod:start(State),
-            PidRefs = [spawn_monitor(fun() -> Client(N, M, ServerPid) end) ||
+            PidRefs = [spawn_monitor(fun() -> Client(0, M, ServerPid) end) ||
                           _ <- lists:seq(1, Parallel)],
-            _ = [receive {'DOWN', Ref, _, _, _} -> ok end ||
-                    {_Pid, Ref} <- PidRefs],
-            ok = ServerMod:stop(ServerPid)
+            timer:sleep(?MAX_TIME),
+            try
+                AllPidsN = collect(PidRefs, []),
+                TotalLoops = lists:sum(AllPidsN),
+                TotalLoops
+            after
+                ok = ServerMod:stop(ServerPid)
+            end
     end.
+
+collect([], Result) ->
+    Result;
+collect([{Pid, Ref}|PidRefs], Result) ->
+    N = case erlang:process_info(Pid, dictionary) of
+            {dictionary, Dict} ->
+                {?COUNTER, N0} = lists:keyfind(?COUNTER, 1, Dict),
+                N0;
+            undefined -> % Process did not start in ?MAX_TIME_SECS.
+                0
+        end,
+    exit(Pid, kill),
+    receive {'DOWN', Ref, _, _, _} -> ok end,
+    collect(PidRefs, [N|Result]).
 
 run_test(Test) ->
     {T1, _} = statistics(runtime),
-    Test(),
+    Result = Test(),
     {T2, _} = statistics(runtime),
-    T2 - T1.
+    {Result, T2 - T1}.

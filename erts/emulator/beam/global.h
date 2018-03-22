@@ -1,7 +1,7 @@
 /*
  * %CopyrightBegin%
  *
- * Copyright Ericsson AB 1996-2017. All Rights Reserved.
+ * Copyright Ericsson AB 1996-2018. All Rights Reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -87,9 +87,7 @@ typedef struct
 {
     erts_mtx_t lock;
     ErtsMonitor* root;
-    int pending_failed_fire;
-    int is_dying;
-
+    Uint refc;
     size_t user_data_sz;
 } ErtsResourceMonitors;
 
@@ -116,7 +114,8 @@ extern void erts_pre_nif(struct enif_environment_t*, Process*,
 			 struct erl_module_nif*, Process* tracee);
 extern void erts_post_nif(struct enif_environment_t* env);
 extern void erts_resource_stop(ErtsResource*, ErlNifEvent, int is_direct_call);
-void erts_fire_nif_monitor(ErtsResource*, Eterm pid, Eterm ref);
+void erts_fire_nif_monitor(ErtsMonitor *tmon);
+void erts_nif_demonitored(ErtsResource* resource);
 extern Eterm erts_nif_taints(Process* p);
 extern void erts_print_nif_taints(fmtfn_t to, void* to_arg);
 void erts_unload_nif(struct erl_module_nif* nif);
@@ -368,7 +367,7 @@ do {\
 	UWord _wsz = ESTACK_COUNT(s);\
 	(dst)->start = erts_alloc((s).alloc_type,\
 				  DEF_ESTACK_SIZE * sizeof(Eterm));\
-	memcpy((dst)->start, (s).start,_wsz*sizeof(Eterm));\
+	sys_memcpy((dst)->start, (s).start,_wsz*sizeof(Eterm));\
 	(dst)->sp = (dst)->start + _wsz;\
 	(dst)->end = (dst)->start + DEF_ESTACK_SIZE;\
         (dst)->edefault = NULL;\
@@ -536,7 +535,7 @@ do {\
 	UWord _wsz = WSTACK_COUNT(s);\
 	(dst)->wstart = erts_alloc(s.alloc_type,\
 				  DEF_WSTACK_SIZE * sizeof(UWord));\
-	memcpy((dst)->wstart, s.wstart,_wsz*sizeof(UWord));\
+	sys_memcpy((dst)->wstart, s.wstart,_wsz*sizeof(UWord));\
 	(dst)->wsp = (dst)->wstart + _wsz;\
 	(dst)->wend = (dst)->wstart + DEF_WSTACK_SIZE;\
         (dst)->wdefault = NULL;\
@@ -861,6 +860,7 @@ Eterm erts_new_heap_binary(Process *p, byte *buf, int len, byte** datap);
 Eterm erts_new_mso_binary(Process*, byte*, Uint);
 Eterm new_binary(Process*, byte*, Uint);
 Eterm erts_realloc_binary(Eterm bin, size_t size);
+Eterm erts_build_proc_bin(ErlOffHeap*, Eterm*, Binary*);
 
 /* erl_bif_info.c */
 
@@ -885,6 +885,7 @@ void erts_init_trap_export(Export* ep, Eterm m, Eterm f, Uint a,
 			   Eterm (*bif)(Process*, Eterm*, BeamInstr*));
 void erts_init_bif(void);
 Eterm erl_send(Process *p, Eterm to, Eterm msg);
+int erts_set_group_leader(Process *proc, Eterm new_gl);
 
 /* erl_bif_op.c */
 
@@ -907,7 +908,6 @@ extern erts_atomic_t erts_copy_literal_area__;
 #define ERTS_COPY_LITERAL_AREA()					\
     ((ErtsLiteralArea *) erts_atomic_read_nob(&erts_copy_literal_area__))
 extern Process *erts_literal_area_collector;
-extern Process *erts_dirty_process_code_checker;
 
 extern Process *erts_code_purger;
 
@@ -947,8 +947,8 @@ void erts_update_ranges(BeamInstr* code, Uint size);
 void erts_remove_from_ranges(BeamInstr* code);
 UWord erts_ranges_sz(void);
 void erts_lookup_function_info(FunctionInfo* fi, BeamInstr* pc, int full_info);
-ErtsLiteralArea** erts_dump_lit_areas;
-Uint erts_dump_num_lit_areas;
+extern ErtsLiteralArea** erts_dump_lit_areas;
+extern Uint erts_dump_num_lit_areas;
 
 /* break.c */
 void init_break_handler(void);
@@ -1065,13 +1065,13 @@ Eterm copy_struct_x(Eterm, Uint, Eterm**, ErlOffHeap*, Uint*, erts_literal_area_
 #define copy_struct_litopt(Obj,Sz,HPP,OH,LitArea) \
     copy_struct_x(Obj,Sz,HPP,OH,NULL,LitArea)
 
-Eterm copy_shallow(Eterm*, Uint, Eterm**, ErlOffHeap*);
+Eterm copy_shallow(Eterm* ERTS_RESTRICT, Uint, Eterm**, ErlOffHeap*);
 
 void erts_move_multi_frags(Eterm** hpp, ErlOffHeap*, ErlHeapFragment* first,
 			   Eterm* refs, unsigned nrefs, int literals);
 
 /* Utilities */
-extern void erts_delete_nodes_monitors(Process *, ErtsProcLocks);
+void erts_monitor_nodes_delete(ErtsMonitor *);
 extern Eterm erts_monitor_nodes(Process *, Eterm, Eterm);
 extern Eterm erts_processes_monitoring_nodes(Process *);
 extern int erts_do_net_exits(DistEntry*, Eterm);
@@ -1122,7 +1122,6 @@ extern int erts_no_line_info;
 extern Eterm erts_error_logger_warnings;
 extern int erts_initialized;
 extern int erts_compat_rel;
-extern int erts_use_sender_punish;
 void erl_start(int, char**);
 void erts_usage(void);
 Eterm erts_preloaded(Process* p);
@@ -1264,7 +1263,7 @@ char* erts_convert_filename_to_wchar(byte* bytes, Uint size,
                                      char *statbuf, size_t statbuf_size,
                                      ErtsAlcType_t alloc_type, Sint* used,
                                      Uint extra_wchars);
-Eterm erts_convert_native_to_filename(Process *p, byte *bytes);
+Eterm erts_convert_native_to_filename(Process *p, size_t size, byte *bytes);
 Eterm erts_utf8_to_list(Process *p, Uint num, byte *bytes, Uint sz, Uint left,
 			Uint *num_built, Uint *num_eaten, Eterm tail);
 int erts_utf8_to_latin1(byte* dest, const byte* source, int slen);

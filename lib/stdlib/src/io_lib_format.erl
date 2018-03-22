@@ -95,7 +95,7 @@ print([]) ->
     [].
 
 print(C, F, Ad, P, Pad, Encoding, Strings) ->
-    [$~] ++ print_field_width(F, Ad) ++ print_precision(P) ++
+    [$~] ++ print_field_width(F, Ad) ++ print_precision(P, Pad) ++
         print_pad_char(Pad) ++ print_encoding(Encoding) ++
         print_strings(Strings) ++ [C].
 
@@ -103,8 +103,9 @@ print_field_width(none, _Ad) -> "";
 print_field_width(F, left) -> integer_to_list(-F);
 print_field_width(F, right) -> integer_to_list(F).
 
-print_precision(none) -> "";
-print_precision(P) -> [$. | integer_to_list(P)].
+print_precision(none, $\s) -> "";
+print_precision(none, _Pad) -> ".";  % pad must be second dot
+print_precision(P, _Pad) -> [$. | integer_to_list(P)].
 
 print_pad_char($\s) -> ""; % default, no need to make explicit
 print_pad_char(Pad) -> [$., Pad].
@@ -126,25 +127,23 @@ collect_cseq(Fmt0, Args0) ->
     {F,Ad,Fmt1,Args1} = field_width(Fmt0, Args0),
     {P,Fmt2,Args2} = precision(Fmt1, Args1),
     {Pad,Fmt3,Args3} = pad_char(Fmt2, Args2),
-    {Encoding,Fmt4,Args4} = encoding(Fmt3, Args3),
-    {Strings,Fmt5,Args5} = strings(Fmt4, Args4),
-    {C,As,Fmt6,Args6} = collect_cc(Fmt5, Args5),
-    FormatSpec = #{control_char => C, args => As, width => F, adjust => Ad,
-                   precision => P, pad_char => Pad, encoding => Encoding,
-                   strings => Strings},
-    {FormatSpec,Fmt6,Args6}.
+    Spec0 = #{width => F,
+              adjust => Ad,
+              precision => P,
+              pad_char => Pad,
+              encoding => latin1,
+              strings => true},
+    {Spec1,Fmt4} = modifiers(Fmt3, Spec0),
+    {C,As,Fmt5,Args4} = collect_cc(Fmt4, Args3),
+    Spec2 = Spec1#{control_char => C, args => As},
+    {Spec2,Fmt5,Args4}.
 
-encoding([$t|Fmt],Args) ->
-    true = hd(Fmt) =/= $l,
-    {unicode,Fmt,Args};
-encoding(Fmt,Args) ->
-    {latin1,Fmt,Args}.
-
-strings([$l|Fmt],Args) ->
-    true = hd(Fmt) =/= $t,
-    {false,Fmt,Args};
-strings(Fmt,Args) ->
-    {true,Fmt,Args}.
+modifiers([$t|Fmt], Spec) ->
+    modifiers(Fmt, Spec#{encoding => unicode});
+modifiers([$l|Fmt], Spec) ->
+    modifiers(Fmt, Spec#{strings => false});
+modifiers(Fmt, Spec) ->
+    {Spec, Fmt}.
 
 field_width([$-|Fmt0], Args0) ->
     {F,Fmt,Args} = field_value(Fmt0, Args0),
